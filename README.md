@@ -6,7 +6,8 @@ studies binding affinity at the CB2 receptor. A human approves each step.
 ## Models
 
 - **Claude** (Anthropic API) for planning
-- **Local models** through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b) for reviewing and small tasks
+- **GPT** (OpenAI API) for reviewing
+- **Local models** through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b) for checking plans against a checklist and small tasks
 
 ## Setup
 
@@ -16,10 +17,10 @@ Needs Python 3.10+ and, for the local models, Ollama.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then add your preferred API key
+cp .env.example .env   # then add your Anthropic and OpenAI API keys
 ```
 
-Check that both models answer:
+Check that all three models answer:
 
 ```bash
 python -m cb2.llm

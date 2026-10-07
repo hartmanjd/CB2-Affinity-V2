@@ -6,7 +6,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from cb2.llm import ask_claude, ask_ollama
+from cb2.checklist import check_plan
+from cb2.llm import ask_claude, ask_openai
 
 PLANNER_PROMPT = """You are planning a small computational chemistry study of the
 cannabinoid receptor 2 (CB2). The study will only use published binding affinity
@@ -24,12 +25,15 @@ Your previous plan:
 A reviewer's critique of it:
 {review}
 
+Checklist results (items not marked covered still need addressing):
+{checklist}
+
 Feedback from the project lead:
 {feedback}
 
-Write an improved plan that addresses the lead's feedback and the most important
-points of the critique. Keep it to 3 to 5 numbered steps: rewrite the plan, don't add
-to it. If a point in the critique is wrong or doesn't fit the study, don't follow it;
+Write an improved plan that addresses the lead's feedback, the most important
+points of the critique and the open checklist items. Keep it to 3 to 5 numbered
+steps: rewrite the plan, don't add to it. If a point in the critique is wrong or doesn't fit the study, don't follow it;
 list any such points in a short note at the end, at most 3 bullets."""
 
 REVIEWER_PROMPT = """You are a critical reviewer of computational chemistry research plans.
@@ -52,6 +56,7 @@ class State(TypedDict, total=False):
     question: str
     plan: str
     review: str
+    checklist_report: str
     human_feedback: str
     approved: bool
     revisions: int
@@ -65,6 +70,7 @@ def planner(state: State) -> dict:
         question=state["question"],
         plan=state["plan"],
         review=state["review"],
+        checklist=state["checklist_report"],
         feedback=state["human_feedback"] or NO_FEEDBACK,
     )
     return {"plan": ask_claude(prompt), "revisions": state["revisions"] + 1}
@@ -72,12 +78,17 @@ def planner(state: State) -> dict:
 
 def reviewer(state: State) -> dict:
     prompt = REVIEWER_PROMPT.format(question=state["question"], plan=state["plan"])
-    return {"review": ask_ollama(prompt)}
+    return {"review": ask_openai(prompt)}
+
+
+def checklist(state: State) -> dict:
+    return {"checklist_report": check_plan(state["plan"])}
 
 
 def human_approval(state: State) -> dict:
     # Pause the run until a person answers; their answer becomes the return value
-    answer = str(interrupt({"plan": state["plan"], "review": state["review"]}) or "").strip()
+    shown = {key: state[key] for key in ("plan", "review", "checklist_report")}
+    answer = str(interrupt(shown) or "").strip()
     return {"human_feedback": answer, "approved": answer.lower() == "approve"}
 
 
@@ -92,10 +103,12 @@ def make_builder() -> StateGraph:
     builder = StateGraph(State)
     builder.add_node("planner", planner)
     builder.add_node("reviewer", reviewer)
+    builder.add_node("checklist", checklist)
     builder.add_node("human_approval", human_approval)
     builder.add_edge(START, "planner")
     builder.add_edge("planner", "reviewer")
-    builder.add_edge("reviewer", "human_approval")
+    builder.add_edge("reviewer", "checklist")
+    builder.add_edge("checklist", "human_approval")
     builder.add_conditional_edges("human_approval", after_approval, ["planner", END])
     return builder
 
@@ -118,7 +131,8 @@ if __name__ == "__main__":
     # Each pause asks for an answer; resuming runs until the next pause or the end
     while "__interrupt__" in result:
         print(f"\n=== PLAN (Claude, revision {result['revisions']}) ===\n" + result["plan"])
-        print("\n=== REVIEW (local model) ===\n" + result["review"])
+        print("\n=== REVIEW (OpenAI) ===\n" + result["review"])
+        print("\n=== CHECKLIST (local model) ===\n" + result["checklist_report"])
         answer = input("\nType 'approve', write feedback, or press Enter to revise from the review: ")
         result = graph.invoke(Command(resume=answer), config)
 
