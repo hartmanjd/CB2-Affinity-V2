@@ -28,7 +28,8 @@ Feedback from the project lead:
 {feedback}
 
 Write an improved plan that addresses the lead's feedback and the most important
-points of the critique."""
+points of the critique. If a point in the critique is wrong or doesn't fit the study,
+say so briefly and don't follow it."""
 
 REVIEWER_PROMPT = """You are a critical reviewer of computational chemistry research plans.
 
@@ -40,6 +41,9 @@ Plan:
 List the three most important weaknesses or risks in this plan, one or two sentences each."""
 
 MAX_REVISIONS = 2
+
+# Used when the lead leaves the answer blank: revise from the critique alone
+NO_FEEDBACK = "None given. Address the most important points of the critique."
 
 
 # The shared notebook every node reads from and writes to
@@ -53,14 +57,14 @@ class State(TypedDict, total=False):
 
 
 def planner(state: State) -> dict:
-    # First pass: plan from the question. Later passes: revise using the feedback
-    if not state.get("human_feedback"):
+    # First pass: plan from the question. Later passes: revise the existing plan
+    if "plan" not in state:
         return {"plan": ask_claude(PLANNER_PROMPT.format(question=state["question"])), "revisions": 0}
     prompt = REVISION_PROMPT.format(
         question=state["question"],
         plan=state["plan"],
         review=state["review"],
-        feedback=state["human_feedback"],
+        feedback=state["human_feedback"] or NO_FEEDBACK,
     )
     return {"plan": ask_claude(prompt), "revisions": state["revisions"] + 1}
 
@@ -72,7 +76,7 @@ def reviewer(state: State) -> dict:
 
 def human_approval(state: State) -> dict:
     # Pause the run until a person answers; their answer becomes the return value
-    answer = str(interrupt({"plan": state["plan"], "review": state["review"]})).strip()
+    answer = str(interrupt({"plan": state["plan"], "review": state["review"]}) or "").strip()
     return {"human_feedback": answer, "approved": answer.lower() == "approve"}
 
 
@@ -114,7 +118,7 @@ if __name__ == "__main__":
     while "__interrupt__" in result:
         print(f"\n=== PLAN (Claude, revision {result['revisions']}) ===\n" + result["plan"])
         print("\n=== REVIEW (local model) ===\n" + result["review"])
-        answer = input("\nType 'approve', or write feedback for the planner: ")
+        answer = input("\nType 'approve', write feedback, or press Enter to revise from the review: ")
         result = graph.invoke(Command(resume=answer), config)
 
     status = "approved" if result["approved"] else f"stopped after {MAX_REVISIONS} revisions"
