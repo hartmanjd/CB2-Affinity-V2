@@ -1,5 +1,6 @@
 anthropic>=1.11
 ollama>=0.6
+openai>=3.26
 python-dotenv>=1.2
 langgraph>=1.2
 langgraph-cli[inmem]>=0.4
