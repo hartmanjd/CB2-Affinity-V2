@@ -10,6 +10,8 @@ load_dotenv()
 
 CLAUDE_MODEL = "claude-opus-5-5"
 OLLAMA_MODEL = "gemma4:26b"
+# Tokens the local model can hold at once (prompt plus answer); Ollama's default is too small for long plans
+OLLAMA_CONTEXT = 8192
 
 
 def ask_claude(prompt: str, model: str = CLAUDE_MODEL, max_tokens: int = 16000) -> str:
@@ -33,7 +35,16 @@ def ask_claude(prompt: str, model: str = CLAUDE_MODEL, max_tokens: int = 16000) 
 
 def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
     client = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://localhost:11434"))
-    response = client.chat(model=model, messages=[{"role": "user", "content": prompt}])
+    response = client.chat(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        options={"num_ctx": OLLAMA_CONTEXT},
+    )
+    if not response.message.content:
+        raise RuntimeError(
+            f"{model} returned no answer text (done_reason: {response.done_reason}, "
+            f"prompt tokens: {response.prompt_eval_count}, context: {OLLAMA_CONTEXT})"
+        )
     return response.message.content
 
 

@@ -28,8 +28,9 @@ Feedback from the project lead:
 {feedback}
 
 Write an improved plan that addresses the lead's feedback and the most important
-points of the critique. If a point in the critique is wrong or doesn't fit the study,
-say so briefly and don't follow it."""
+points of the critique. Keep it to 3 to 5 numbered steps: rewrite the plan, don't add
+to it. If a point in the critique is wrong or doesn't fit the study, don't follow it;
+list any such points in a short note at the end, at most 3 bullets."""
 
 REVIEWER_PROMPT = """You are a critical reviewer of computational chemistry research plans.
 
