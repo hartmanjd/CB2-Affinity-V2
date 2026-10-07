@@ -1,0 +1,26 @@
+# CB2-Affinity-V2
+
+A small "research team" of AI models, wired together with LangGraph, that
+studies binding affinity at the CB2 receptor. A human approves each step.
+
+## Models
+
+- **Claude** (Anthropic API) for planning
+- **Local models** through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b) for reviewing and small tasks
+
+## Setup
+
+Needs Python 3.10+ and, for the local models, Ollama.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # then add your preferred API key
+```
+
+Check that both models answer:
+
+```bash
+python -m cb2.llm
+```
