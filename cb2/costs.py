@@ -6,23 +6,21 @@
 # Cache writes are the 5-minute rate. Local models aren't listed: they cost nothing.
 PRICES = {
     "claude-opus-5-5": {"input": 4.00, "cache_write": 5.00, "cache_read": 0.20, "output": 20.00},
-    # Fast mode doubles the price; the cache rates are assumed to double too
-    "claude-opus-5-5 fast": {"input": 8.00, "cache_write": 10.00, "cache_read": 0.40, "output": 40.00},
     "claude-sonnet-5-5": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.20, "output": 10.00},
     "claude-haiku-5-5": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
     # Haiku 5.5 charges 5x for the whole request when the prompt is over 100,000 tokens
     "claude-haiku-5-5 long": {"input": 0.50, "cache_write": 0.625, "cache_read": 0.05, "output": 2.50},
     "gpt-6-astra": {"input": 10.00, "cache_write": 12.50, "cache_read": 1.00, "output": 50.00},
+    "gpt-6-sol": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.20, "output": 10.00},
+    "gpt-6-luna": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
 }
 HAIKU_LONG_PROMPT = 100_000
 
 
 def dollars(model: str, input_tokens: int, output_tokens: int,
-            cache_read_tokens: int = 0, cache_write_tokens: int = 0, fast: bool = False) -> float | None:
+            cache_read_tokens: int = 0, cache_write_tokens: int = 0) -> float | None:
     prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
-    if fast:
-        model += " fast"
-    elif model == "claude-haiku-5-5" and prompt_tokens > HAIKU_LONG_PROMPT:
+    if model == "claude-haiku-5-5" and prompt_tokens > HAIKU_LONG_PROMPT:
         model += " long"
     # A model missing from the table gets None, so it shows up as "price unknown" instead of $0
     if model not in PRICES:
@@ -42,9 +40,8 @@ def round_cost(costs: list[dict], round_number: int) -> float:
 
 
 def model_label(call: dict) -> str:
-    # The model plus any settings that change its speed or cost, e.g. "claude-opus-5-5 (high, fast)"
-    settings = [s for s in (call["effort"], "fast" if call["fast"] else None) if s]
-    return f"{call['model']} ({', '.join(settings)})" if settings else call["model"]
+    # The model plus its effort level if one was set, e.g. "claude-opus-5-5 (high)"
+    return f"{call['model']} ({call['effort']})" if call["effort"] else call["model"]
 
 
 def format_call(call: dict) -> str:
