@@ -205,6 +205,8 @@ class Settings:
     max_lookups: int = 15
     # Download again even if the same targets were downloaded before
     fresh_download: bool = False
+    # Practice runs log to practice-runs/ (git-ignored) instead of runs/, so they stay out of the record
+    practice: bool = False
 
 
 def effort(value: str) -> str | None:
@@ -538,10 +540,11 @@ if __name__ == "__main__":
     parser.add_argument("--auditor-model", default=Settings.auditor_model, choices=list(MODELS))
     parser.add_argument("--max-lookups", type=int, default=Settings.max_lookups)
     parser.add_argument("--fresh-download", action="store_true")
+    parser.add_argument("--practice", action="store_true", help="log to practice-runs/, which git ignores")
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
     args = parser.parse_args()
     settings = Settings(args.planner_model, args.planner_effort, args.reviewer_model, args.reviewer_effort,
-                        args.auditor_model, args.max_lookups, args.fresh_download)
+                        args.auditor_model, args.max_lookups, args.fresh_download, args.practice)
 
     graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}
@@ -556,4 +559,6 @@ if __name__ == "__main__":
         result = graph.invoke(Command(resume=input(prompt)), config, context=settings)
 
     status = "approved" if result.get("findings_approved") else "stopped at the budget"
-    print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). Log: runs/{result['run_id']}/log.md")
+    log_folder = "practice-runs" if settings.practice else "runs"
+    print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). "
+          f"Log: {log_folder}/{result['run_id']}/log.md")
