@@ -1,14 +1,17 @@
 """The research team's workflow, built as a LangGraph graph."""
 
+import argparse
 import operator
+from dataclasses import dataclass
 from typing import Annotated, Literal, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
 from cb2.costs import round_cost, spent, summary
-from cb2.llm import ask_claude, ask_openai
+from cb2.llm import EFFORTS, MODELS, ask, check_choice
 
 PLANNER_PROMPT = """You are planning a small computational chemistry study of the
 cannabinoid receptor 2 (CB2). The study will only use published binding affinity
@@ -50,6 +53,26 @@ DEFAULT_BUDGET = 2.00
 NO_FEEDBACK = "None given. Address the most important points of the critique."
 
 
+ModelName = Literal[tuple(MODELS)]
+Effort = Literal[("default",) + EFFORTS]
+
+
+# Which model plays each role, chosen per run. LangGraph Studio shows these as a form,
+# and each saved combination becomes an "assistant" you can pick from.
+@dataclass
+class Settings:
+    planner_model: ModelName = "claude-opus-5-5"
+    planner_effort: Effort = "default"
+    planner_fast: bool = False
+    reviewer_model: ModelName = "gpt-6-astra"
+    reviewer_effort: Effort = "default"
+
+
+def effort(value: str) -> str | None:
+    # "default" means don't send an effort, so the model uses its own default
+    return None if value == "default" else value
+
+
 # The shared notebook every node reads from and writes to
 class State(TypedDict, total=False):
     question: str
@@ -64,7 +87,11 @@ class State(TypedDict, total=False):
     costs: Annotated[list[dict], operator.add]
 
 
-def budget_gate(state: State) -> Command[Literal["planner", "budget_gate", "__end__"]]:
+def budget_gate(state: State, runtime: Runtime[Settings]) -> Command[Literal["planner", "budget_gate", "__end__"]]:
+    settings = runtime.context or Settings()
+    check_choice("planner", settings.planner_model, effort(settings.planner_effort), settings.planner_fast)
+    check_choice("reviewer", settings.reviewer_model, effort(settings.reviewer_effort), False)
+
     # Before each round, guess it will cost about what the last one did (nothing to go on before the first)
     budget = state.get("budget", DEFAULT_BUDGET)
     costs = state.get("costs", [])
@@ -85,7 +112,8 @@ def budget_gate(state: State) -> Command[Literal["planner", "budget_gate", "__en
     return Command(update={"budget": new_budget}, goto="budget_gate")
 
 
-def planner(state: State) -> dict:
+def planner(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
     # First pass: plan from the question. Later passes: revise the existing plan
     if "plan" not in state:
         prompt = PLANNER_PROMPT.format(question=state["question"])
@@ -98,12 +126,14 @@ def planner(state: State) -> dict:
             feedback=state["human_feedback"] or NO_FEEDBACK,
         )
         revisions = state["revisions"] + 1
-    plan, usage = ask_claude(prompt)
+    plan, usage = ask(prompt, settings.planner_model, effort(settings.planner_effort), settings.planner_fast)
     return {"plan": plan, "revisions": revisions, "costs": [{"node": "planner", "round": revisions, **usage}]}
 
 
-def reviewer(state: State) -> dict:
-    review, usage = ask_openai(REVIEWER_PROMPT.format(question=state["question"], plan=state["plan"]))
+def reviewer(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    prompt = REVIEWER_PROMPT.format(question=state["question"], plan=state["plan"])
+    review, usage = ask(prompt, settings.reviewer_model, effort(settings.reviewer_effort))
     return {"review": review, "costs": [{"node": "reviewer", "round": state["revisions"], **usage}]}
 
 
@@ -125,7 +155,7 @@ def after_approval(state: State) -> str:
 
 
 def make_builder() -> StateGraph:
-    builder = StateGraph(State)
+    builder = StateGraph(State, context_schema=Settings)
     builder.add_node("budget_gate", budget_gate)
     builder.add_node("planner", planner)
     builder.add_node("reviewer", reviewer)
@@ -143,14 +173,25 @@ def build_graph():
 
 
 if __name__ == "__main__":
-    graph = make_builder().compile(checkpointer=InMemorySaver())
-    for edge in graph.get_graph().edges:
-        print(f"{edge.source} -> {edge.target}")
+    # Usage: python -m cb2.graph [--planner-model gemma4:26b] [--budget 0.50] ...
+    parser = argparse.ArgumentParser(description="Run the research team from the terminal.")
+    parser.add_argument("--planner-model", default=Settings.planner_model, choices=list(MODELS))
+    parser.add_argument("--planner-effort", default="default", choices=["default", *EFFORTS])
+    parser.add_argument("--planner-fast", action="store_true", help="fast mode (claude-opus-5-5 only)")
+    parser.add_argument("--reviewer-model", default=Settings.reviewer_model, choices=list(MODELS))
+    parser.add_argument("--reviewer-effort", default="default", choices=["default", *EFFORTS])
+    parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
+    args = parser.parse_args()
+    settings = Settings(args.planner_model, args.planner_effort, args.planner_fast,
+                        args.reviewer_model, args.reviewer_effort)
 
+    graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}
     result = graph.invoke(
-        {"question": "Which ligand features predict high binding affinity at the CB2 receptor?"},
+        {"question": "Which ligand features predict high binding affinity at the CB2 receptor?",
+         "budget": args.budget},
         config,
+        context=settings,
     )
     # Each pause asks for an answer; resuming runs until the next pause or the end
     while "__interrupt__" in result:
@@ -158,11 +199,11 @@ if __name__ == "__main__":
         if pause["kind"] == "budget":
             answer = input(f"\n=== BUDGET ===\n{pause['message']}\n> ")
         else:
-            print(f"\n=== PLAN (Claude, revision {result['revisions']}) ===\n" + pause["plan"])
-            print("\n=== REVIEW (OpenAI) ===\n" + pause["review"])
+            print(f"\n=== PLAN ({settings.planner_model}, revision {result['revisions']}) ===\n" + pause["plan"])
+            print(f"\n=== REVIEW ({settings.reviewer_model}) ===\n" + pause["review"])
             print("\n=== COSTS ===\n" + pause["costs"])
             answer = input("\nType 'approve', write feedback, or press Enter to revise from the review: ")
-        result = graph.invoke(Command(resume=answer), config)
+        result = graph.invoke(Command(resume=answer), config, context=settings)
 
     status = "approved" if result.get("approved") else "stopped at the budget"
     print(f"\nFinal plan ({status}, ${spent(result['costs']):.3f} spent):\n" + result["plan"])

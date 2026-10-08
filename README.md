@@ -5,9 +5,18 @@ studies binding affinity at the CB2 receptor. A human approves each step.
 
 ## Models
 
-- **Claude** (Anthropic API) for planning
-- **GPT** (OpenAI API) for reviewing
-- **Local models** through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b) for small tasks
+By default **Claude** (claude-opus-5-5) plans and **GPT** (gpt-6-astra) reviews. Any role
+can be played by any model in `MODELS` in `cb2/llm.py`: Claude Opus, Sonnet or Haiku 5.5,
+GPT-6 Astra, or local models through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b).
+To use another local model, add one line there.
+
+Choose per run, with effort levels (Claude and GPT) and fast mode (Claude Opus 5.5 only;
+Anthropic has to enable it for your account):
+
+- **LangGraph Studio:** the settings form on the assistant (`planner_model`,
+  `planner_effort`, `planner_fast`, `reviewer_model`, `reviewer_effort`). Save
+  combinations as assistants, e.g. a local-only team.
+- **Terminal:** `python -m cb2.graph --planner-model gemma4:26b --reviewer-effort high --budget 0.50`
 
 ## Setup
 
@@ -20,7 +29,7 @@ pip install -r requirements.txt
 cp .env.example .env   # then add your Anthropic and OpenAI API keys
 ```
 
-Check that all three models answer:
+Check that one model from each provider answers (or name models to try):
 
 ```bash
 python -m cb2.llm
