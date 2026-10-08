@@ -11,7 +11,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
 from cb2.costs import round_cost, spent, summary
-from cb2.llm import EFFORTS, MODELS, ask, check_choice
+from cb2.llm import EFFORTS, MODELS, ask, check_model
 
 PLANNER_PROMPT = """You are planning a small computational chemistry study of the
 cannabinoid receptor 2 (CB2). The study will only use published binding affinity
@@ -59,11 +59,11 @@ Effort = Literal[("default",) + EFFORTS]
 
 # Which model plays each role, chosen per run. LangGraph Studio shows these as a form,
 # and each saved combination becomes an "assistant" you can pick from.
+# Effort is ignored by models that don't have it (the local ones).
 @dataclass
 class Settings:
     planner_model: ModelName = "claude-opus-5-5"
     planner_effort: Effort = "default"
-    planner_fast: bool = False
     reviewer_model: ModelName = "gpt-6-astra"
     reviewer_effort: Effort = "default"
 
@@ -89,8 +89,8 @@ class State(TypedDict, total=False):
 
 def budget_gate(state: State, runtime: Runtime[Settings]) -> Command[Literal["planner", "budget_gate", "__end__"]]:
     settings = runtime.context or Settings()
-    check_choice("planner", settings.planner_model, effort(settings.planner_effort), settings.planner_fast)
-    check_choice("reviewer", settings.reviewer_model, effort(settings.reviewer_effort), False)
+    check_model("planner", settings.planner_model)
+    check_model("reviewer", settings.reviewer_model)
 
     # Before each round, guess it will cost about what the last one did (nothing to go on before the first)
     budget = state.get("budget", DEFAULT_BUDGET)
@@ -126,7 +126,7 @@ def planner(state: State, runtime: Runtime[Settings]) -> dict:
             feedback=state["human_feedback"] or NO_FEEDBACK,
         )
         revisions = state["revisions"] + 1
-    plan, usage = ask(prompt, settings.planner_model, effort(settings.planner_effort), settings.planner_fast)
+    plan, usage = ask(prompt, settings.planner_model, effort(settings.planner_effort))
     return {"plan": plan, "revisions": revisions, "costs": [{"node": "planner", "round": revisions, **usage}]}
 
 
@@ -177,13 +177,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the research team from the terminal.")
     parser.add_argument("--planner-model", default=Settings.planner_model, choices=list(MODELS))
     parser.add_argument("--planner-effort", default="default", choices=["default", *EFFORTS])
-    parser.add_argument("--planner-fast", action="store_true", help="fast mode (claude-opus-5-5 only)")
     parser.add_argument("--reviewer-model", default=Settings.reviewer_model, choices=list(MODELS))
     parser.add_argument("--reviewer-effort", default="default", choices=["default", *EFFORTS])
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
     args = parser.parse_args()
-    settings = Settings(args.planner_model, args.planner_effort, args.planner_fast,
-                        args.reviewer_model, args.reviewer_effort)
+    settings = Settings(args.planner_model, args.planner_effort, args.reviewer_model, args.reviewer_effort)
 
     graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}

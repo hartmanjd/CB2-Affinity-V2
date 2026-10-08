@@ -18,30 +18,30 @@ load_dotenv()
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
-# Every model the team can use. To add one (say, a bigger local model), add a line here,
-# and for a paid model also add its prices to cb2/costs.py.
+# Every model the team can use, by the name shown in the settings. To add one (say, a bigger
+# local model), add a line here, and for a paid model also add its prices to cb2/costs.py.
 MODELS = {
-    "claude-opus-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fast": True, "fallbacks": True},
-    "claude-sonnet-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fast": False, "fallbacks": True},
+    "claude-opus-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fallbacks": True},
+    # Same model in fast mode: faster output at double the price. Anthropic has to enable it for
+    # the account first (https://claude.com/fast-mode); until then its rate limit is 0
+    "claude-opus-5-5 (fast)": {"provider": "anthropic", "api_model": "claude-opus-5-5", "fast": True,
+                               "efforts": EFFORTS, "fallbacks": True},
+    "claude-sonnet-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fallbacks": True},
     # Haiku 5.5 has no server-side fallback model, so a refusal simply stops the run
-    "claude-haiku-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fast": False, "fallbacks": False},
-    "gpt-6-astra": {"provider": "openai", "efforts": EFFORTS, "fast": False},
-    "gemma4:26b": {"provider": "ollama", "efforts": (), "fast": False},
-    "qwen3:14b": {"provider": "ollama", "efforts": (), "fast": False},
+    "claude-haiku-5-5": {"provider": "anthropic", "efforts": EFFORTS, "fallbacks": False},
+    "gpt-6-astra": {"provider": "openai", "efforts": EFFORTS},
+    "gemma4:26b": {"provider": "ollama", "efforts": ()},
+    "qwen3:14b": {"provider": "ollama", "efforts": ()},
 }
 
 # Tokens the local model can hold at once (prompt plus answer); Ollama's default is too small for long plans
 OLLAMA_CONTEXT = 8192
 
 
-def check_choice(role: str, model: str, effort: str | None, fast: bool) -> None:
-    # Stop at the start of a run with a clear message, rather than fail or be ignored halfway through
+def check_model(role: str, model: str) -> None:
+    # Stop at the start of a run with a clear message, rather than fail halfway through
     if model not in MODELS:
         raise ValueError(f"{role}: unknown model {model!r}; add it to MODELS in cb2/llm.py")
-    if effort and effort not in MODELS[model]["efforts"]:
-        raise ValueError(f"{role}: {model} has no effort setting {effort!r}; leave it at default")
-    if fast and not MODELS[model]["fast"]:
-        raise ValueError(f"{role}: fast mode is only available on claude-opus-5-5, not {model}")
 
 
 def usage_record(model: str, seconds: float, input_tokens: int, output_tokens: int,
@@ -63,14 +63,17 @@ def usage_record(model: str, seconds: float, input_tokens: int, output_tokens: i
     }
 
 
-def ask(prompt: str, model: str, effort: str | None = None, fast: bool = False) -> tuple[str, dict]:
-    check_choice("ask", model, effort, fast)
-    provider = MODELS[model]["provider"]
-    if provider == "anthropic":
-        return ask_claude(prompt, model, effort, fast)
-    if provider == "openai":
-        return ask_openai(prompt, model, effort)
-    return ask_ollama(prompt, model)
+def ask(prompt: str, model: str, effort: str | None = None) -> tuple[str, dict]:
+    check_model("ask", model)
+    entry = MODELS[model]
+    # Models without effort levels (the local ones) ignore the setting
+    effort = effort if effort in entry["efforts"] else None
+    api_model = entry.get("api_model", model)
+    if entry["provider"] == "anthropic":
+        return ask_claude(prompt, api_model, effort, entry.get("fast", False))
+    if entry["provider"] == "openai":
+        return ask_openai(prompt, api_model, effort)
+    return ask_ollama(prompt, api_model)
 
 
 def ask_claude(prompt: str, model: str = "claude-opus-5-5", effort: str | None = None,
@@ -100,7 +103,8 @@ def ask_claude(prompt: str, model: str = "claude-opus-5-5", effort: str | None =
         # Fast mode is a research preview with its own rate limit, which is 0 until Anthropic enables it
         raise RuntimeError(
             "Fast mode was rate limited. If the limit is 0, fast mode isn't enabled for this "
-            f"Anthropic account yet; turn planner_fast off. Details: {error.message}"
+            "Anthropic account yet (https://claude.com/fast-mode); pick claude-opus-5-5 instead. "
+            f"Details: {error.message}"
         ) from error
     if response.stop_reason == "refusal":
         category = response.stop_details.category if response.stop_details else None
