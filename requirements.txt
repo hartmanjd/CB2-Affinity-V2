@@ -4,3 +4,5 @@ openai>=3.26
 python-dotenv>=1.2
 langgraph>=1.2
 langgraph-cli[inmem]>=0.4
+pandas>=3.0
+requests>=2.34

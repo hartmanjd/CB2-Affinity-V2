@@ -10,6 +10,10 @@ PRICES = {
     "claude-haiku-5-5": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
     # Haiku 5.5 charges 5x for the whole request when the prompt is over 100,000 tokens
     "claude-haiku-5-5 long": {"input": 0.50, "cache_write": 0.625, "cache_read": 0.05, "output": 2.50},
+    # Models Anthropic's server-side fallback may switch to when a request is declined
+    "claude-opus-5": {"input": 5.00, "cache_write": 6.25, "cache_read": 0.50, "output": 25.00},
+    "claude-opus-4-8": {"input": 5.00, "cache_write": 6.25, "cache_read": 0.50, "output": 25.00},
+    "claude-sonnet-5": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.20, "output": 10.00},
     "gpt-6-astra": {"input": 10.00, "cache_write": 12.50, "cache_read": 1.00, "output": 50.00},
     "gpt-6-sol": {"input": 2.00, "cache_write": 2.50, "cache_read": 0.20, "output": 10.00},
     "gpt-6-luna": {"input": 0.10, "cache_write": 0.125, "cache_read": 0.01, "output": 0.50},
@@ -45,12 +49,18 @@ def model_label(call: dict) -> str:
 
 
 def format_call(call: dict) -> str:
-    price = "price unknown" if call["dollars"] is None else f"${call['dollars']:.3f}"
+    # "in" counts tokens charged at or above the input price (including cache writes); "cached" are cache reads.
+    # "~" marks a cost estimated at the requested model's price, because the model that answered isn't priced
+    if call["dollars"] is None:
+        price = "price unknown"
+    else:
+        price = ("~" if call.get("estimated") else "") + f"${call['dollars']:.3f}"
     # Output tokens per second of the whole call: how fast the answer arrived, waiting included
     speed = call["output_tokens"] / call["seconds"] if call["seconds"] else 0
     return (f"{call['node']:<10} {model_label(call):<28} {price:>14}   "
-            f"{call['input_tokens']:>7,} in {call['cache_read_tokens']:>7,} cached {call['output_tokens']:>6,} out   "
-            f"{call['seconds']:>5.1f}s {speed:>5.0f} tok/s")
+            f"{call['input_tokens'] + call['cache_write_tokens']:>7,} in {call['cache_read_tokens']:>7,} cached "
+            f"{call['output_tokens']:>6,} out   "
+            f"{call['seconds']:>5.1f}s {speed:>5.0f} tok/s" + (f"   {call['calls']} calls" if call.get("calls", 1) > 1 else ""))
 
 
 def summary(costs: list[dict], round_number: int, budget: float) -> str:
