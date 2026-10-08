@@ -5,11 +5,11 @@ Stage 2, get the data: the planner searches ChEMBL and proposes which targets to
 the reviewer critiques the choice (with searches of its own) and the auditor checks its numbers.
 Stage 3, explore the data: the planner explores the download with looks and writes findings;
 the reviewer checks them (with looks of its own) and the auditor checks every number.
-Each stage ends with the lead approving or giving feedback, every pause is written to the run
-log in runs/, and a budget gate runs before every round."""
+Every stage is the same loop, built once by make_stage and used three times as a subgraph:
+budget check → worker → reviewer → (auditor) → the lead's approval → back round, or on to the
+next stage. Every pause is written to the run log in runs/."""
 
 import argparse
-import operator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Annotated, Literal, TypedDict
@@ -214,6 +214,15 @@ def effort(value: str) -> str | None:
     return None if value == "default" else value
 
 
+def grow(existing: list, new: list) -> list:
+    """How the growing lists (costs, ledger, history) take updates. A node returns new items, which
+    are appended. A stage hands back its whole list when it finishes, and that list starts with
+    what's already here: take it as the full list rather than adding everything a second time."""
+    if existing and new[:len(existing)] == existing:
+        return new
+    return existing + new
+
+
 # The shared notebook every node reads from and writes to
 class State(TypedDict, total=False):
     question: str
@@ -223,10 +232,12 @@ class State(TypedDict, total=False):
     round: int
     budget: float
     stopped: bool
-    # Lists that grow: operator.add appends what each node returns
-    costs: Annotated[list[dict], operator.add]      # one usage record per model call or tool loop
-    ledger: Annotated[list[dict], operator.add]     # every search, count and look, numbered L1, L2, ...
-    history: Annotated[list[dict], operator.add]    # every round and the lead's reply, for the run log
+    # Set by each approval: did the lead approve this round?
+    approved: bool
+    # Lists that grow as the run goes on
+    costs: Annotated[list[dict], grow]      # one usage record per model call or tool loop
+    ledger: Annotated[list[dict], grow]     # every search, count and look, numbered L1, L2, ...
+    history: Annotated[list[dict], grow]    # every round and the lead's reply, for the run log
     audit_report: str
     # Stage 1: plan
     plan: str
@@ -243,7 +254,7 @@ class State(TypedDict, total=False):
     findings: str
     data_review: str
     data_feedback: str
-    findings_approved: bool
+
 
 
 def cost_record(node: str, state: State, usage: dict) -> dict:
@@ -262,37 +273,83 @@ def pause(state: State, runtime: Runtime[Settings], kind: str, sections: dict[st
     return answer, item
 
 
-def budget_gate(state: State, runtime: Runtime[Settings]) -> Command[Literal["planner", "sourcer", "explorer", "budget_gate", "__end__"]]:
-    settings = runtime.context or Settings()
-    for role in ("planner", "reviewer", "auditor"):
-        check_model(role, getattr(settings, f"{role}_model"))
-    stage = state.get("stage", "plan")
-    worker = {"plan": "planner", "source": "sourcer", "data": "explorer"}[stage]
-    defaults = {
-        "budget": state.get("budget", DEFAULT_BUDGET),
-        "stage": stage,
-        "question": state.get("question") or DEFAULT_QUESTION,
-        "run_id": state.get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ"),
-    }
+# --- The loop every stage shares ---
 
-    # Guess the next round costs about what this stage's last round did (nothing to go on before the first)
-    costs = state.get("costs", [])
-    rounds_in_stage = [call["round"] for call in costs if call["stage"] == stage]
-    estimate = round_cost(costs, max(rounds_in_stage)) if rounds_in_stage else 0.0
-    if spent(costs) + estimate <= defaults["budget"]:
-        return Command(update=defaults, goto=worker)
+def make_budget_gate(stage: str, worker: str):
+    def budget_gate(state: State, runtime: Runtime[Settings]) -> Command:
+        settings = runtime.context or Settings()
+        for role in ("planner", "reviewer", "auditor"):
+            check_model(role, getattr(settings, f"{role}_model"))
+        defaults = {
+            "budget": state.get("budget", DEFAULT_BUDGET),
+            "stage": stage,
+            "question": state.get("question") or DEFAULT_QUESTION,
+            "run_id": state.get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ"),
+        }
 
-    # Over budget: pause and let the person decide whether the next round is worth it
-    message = (f"Spent ${spent(costs):.3f} of the ${defaults['budget']:.2f} budget, and the next round "
-               f"should cost about ${estimate:.3f}. Type a new budget in dollars to continue, "
-               f"or anything else to stop.")
-    answer, item = pause({**state, **defaults}, runtime, "budget", {"Budget": message})
-    try:
-        new_budget = float(answer.removeprefix("$"))
-    except ValueError:
-        return Command(update={**defaults, "stopped": True, "history": [item]}, goto=END)
-    # Check again, in case the new budget still doesn't cover the next round
-    return Command(update={**defaults, "budget": new_budget, "history": [item]}, goto="budget_gate")
+        # Guess the next round costs about what this stage's last round did (nothing to go on before the first)
+        costs = state.get("costs", [])
+        rounds_in_stage = [call["round"] for call in costs if call["stage"] == stage]
+        estimate = round_cost(costs, max(rounds_in_stage)) if rounds_in_stage else 0.0
+        if spent(costs) + estimate <= defaults["budget"]:
+            return Command(update=defaults, goto=worker)
+
+        # Over budget: pause and let the person decide whether the next round is worth it
+        message = (f"Spent ${spent(costs):.3f} of the ${defaults['budget']:.2f} budget, and the next round "
+                   f"should cost about ${estimate:.3f}. Type a new budget in dollars to continue, "
+                   f"or anything else to stop.")
+        answer, item = pause({**state, **defaults}, runtime, "budget", {"Budget": message})
+        try:
+            new_budget = float(answer.removeprefix("$"))
+        except ValueError:
+            return Command(update={**defaults, "stopped": True, "history": [item]}, goto=END)
+        # Check again, in case the new budget still doesn't cover the next round
+        return Command(update={**defaults, "budget": new_budget, "history": [item]}, goto="budget_gate")
+    return budget_gate
+
+
+def make_auditor(sections):
+    def auditor(state: State, runtime: Runtime[Settings]) -> dict:
+        settings = runtime.context or Settings()
+        report, usage = audit(sections(state), state["ledger"], settings.auditor_model)
+        return {"audit_report": report, "costs": [cost_record("auditor", state, usage)] if usage else []}
+    return auditor
+
+
+def make_approval(stage: str, feedback_key: str, sections, not_ready=lambda state: None):
+    """not_ready(state) can return a reason the lead can't approve yet; it becomes the feedback."""
+    def approval(state: State, runtime: Runtime[Settings]) -> dict:
+        answer, item = pause(state, runtime, stage, {
+            **sections(state), "Costs": summary(state["costs"], state["round"], state["budget"])})
+        approved = answer.lower() == "approve"
+        reason = not_ready(state) if approved else None
+        if reason:
+            approved, answer = False, reason
+        return {feedback_key: answer, "approved": approved, "history": [item]}
+    return approval
+
+
+def make_stage(stage: str, worker, reviewer, feedback_key: str, show, audit_sections=None, not_ready=lambda state: None):
+    """One stage as a subgraph: budget check → worker → reviewer → (auditor) → approval.
+    show(state) gives the sections the lead sees; audit_sections(state) the texts to audit."""
+    builder = StateGraph(State, context_schema=Settings)
+    builder.add_node("budget_gate", make_budget_gate(stage, worker.__name__),
+                     destinations=(worker.__name__, "budget_gate", END))
+    builder.add_node(worker.__name__, worker)
+    builder.add_node("reviewer", reviewer)
+    builder.add_node("approval", make_approval(stage, feedback_key, show, not_ready))
+    builder.add_edge(START, "budget_gate")
+    builder.add_edge(worker.__name__, "reviewer")
+    if audit_sections:
+        builder.add_node("auditor", make_auditor(audit_sections))
+        builder.add_edge("reviewer", "auditor")
+        builder.add_edge("auditor", "approval")
+    else:
+        builder.add_edge("reviewer", "approval")
+    # Approved: the stage is done. Otherwise go round again, budget permitting
+    builder.add_conditional_edges("approval", lambda state: END if state["approved"] else "budget_gate",
+                                  ["budget_gate", END])
+    return builder.compile()
 
 
 def lookup_runner(state: State, ledger: list[dict], by: str):
@@ -343,16 +400,6 @@ def plan_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
     prompt = REVIEWER_PROMPT.format(question=state["question"], plan=state["plan"])
     review, usage = ask(prompt, settings.reviewer_model, effort(settings.reviewer_effort))
     return {"review": review, "costs": [cost_record("reviewer", state, usage)]}
-
-
-def plan_approval(state: State, runtime: Runtime[Settings]) -> dict:
-    answer, item = pause(state, runtime, "plan", {
-        "Plan": state["plan"], "Review": state["review"],
-        "Costs": summary(state["costs"], state["round"], state["budget"]),
-    })
-    # Approved: move on to getting the data. Either way the budget gate decides what runs next
-    return {"plan_feedback": answer, "history": [item],
-            **({"stage": "source"} if answer.lower() == "approve" else {})}
 
 
 # --- Stage 2: get the data ---
@@ -419,21 +466,6 @@ def source_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
             "costs": [cost_record("reviewer", state, usage)]}
 
 
-def source_approval(state: State, runtime: Runtime[Settings]) -> Command[Literal["download", "budget_gate"]]:
-    answer, item = pause(state, runtime, "source", {
-        "Proposal": format_proposal(state["proposal"]), "Summary": state["source_summary"],
-        "Review": state["source_review"], "Audit": state["audit_report"],
-        "Costs": summary(state["costs"], state["round"], state["budget"]),
-    })
-    update = {"source_feedback": answer, "history": [item]}
-    if answer.lower() == "approve" and state["proposal"]:
-        return Command(update=update, goto="download")
-    if answer.lower() == "approve":
-        # Nothing to approve yet: ask the planner for a proposal
-        update["source_feedback"] = "You haven't proposed a download yet. Call propose_download."
-    return Command(update=update, goto="budget_gate")
-
-
 def download(state: State, runtime: Runtime[Settings]) -> dict:
     settings = runtime.context or Settings()
     target_ids = state["proposal"]["target_ids"]
@@ -442,7 +474,7 @@ def download(state: State, runtime: Runtime[Settings]) -> dict:
         folder = data.download(target_ids, state["proposal"]["reason"], state["run_id"])
     # The column names and row count are all the agents know before their first look
     entry = overview(data.load(str(folder)), f"L{len(state.get('ledger', [])) + 1}")
-    return {"stage": "data", "data_folder": str(folder), "overview_id": entry["id"],
+    return {"data_folder": str(folder), "overview_id": entry["id"],
             "ledger": [{**entry, "by": "download", "round": state["round"]}]}
 
 
@@ -482,45 +514,35 @@ def data_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
             "costs": [cost_record("reviewer", state, usage)]}
 
 
-def auditor(state: State, runtime: Runtime[Settings]) -> Command[Literal["source_approval", "data_approval"]]:
-    settings = runtime.context or Settings()
-    if state["stage"] == "source":
-        reason = (state.get("proposal") or {}).get("reason", "")
-        sections, goto = {"Summary": f"{reason}\n{state['source_summary']}", "Review": state["source_review"]}, "source_approval"
-    else:
-        sections, goto = {"Findings": state["findings"], "Review": state["data_review"]}, "data_approval"
-    report, usage = audit(sections, state["ledger"], settings.auditor_model)
-    return Command(update={"audit_report": report, "costs": [cost_record("auditor", state, usage)] if usage else []},
-                   goto=goto)
-
-
-def data_approval(state: State, runtime: Runtime[Settings]) -> dict:
-    answer, item = pause(state, runtime, "data", {
-        "Findings": state["findings"], "Review": state["data_review"], "Audit": state["audit_report"],
-        "Costs": summary(state["costs"], state["round"], state["budget"]),
-    })
-    return {"data_feedback": answer, "findings_approved": answer.lower() == "approve", "history": [item]}
-
-
-def after_data_approval(state: State) -> str:
-    return END if state["findings_approved"] else "budget_gate"
-
-
 def make_builder() -> StateGraph:
+    plan = make_stage(
+        "plan", planner, plan_reviewer, "plan_feedback",
+        show=lambda state: {"Plan": state["plan"], "Review": state["review"]})
+    get_data = make_stage(
+        "source", sourcer, source_reviewer, "source_feedback",
+        show=lambda state: {"Proposal": format_proposal(state["proposal"]), "Summary": state["source_summary"],
+                            "Review": state["source_review"], "Audit": state["audit_report"]},
+        audit_sections=lambda state: {"Summary": f"{state['proposal'].get('reason', '')}\n{state['source_summary']}",
+                                      "Review": state["source_review"]},
+        not_ready=lambda state: None if state["proposal"] else
+        "You haven't proposed a download yet. Call propose_download.")
+    explore = make_stage(
+        "data", explorer, data_reviewer, "data_feedback",
+        show=lambda state: {"Findings": state["findings"], "Review": state["data_review"],
+                            "Audit": state["audit_report"]},
+        audit_sections=lambda state: {"Findings": state["findings"], "Review": state["data_review"]})
+
     builder = StateGraph(State, context_schema=Settings)
-    for node in (budget_gate, planner, plan_reviewer, plan_approval, sourcer, source_reviewer, source_approval,
-                 download, explorer, data_reviewer, auditor, data_approval):
-        builder.add_node(node.__name__, node)
-    builder.add_edge(START, "budget_gate")
-    builder.add_edge("planner", "plan_reviewer")
-    builder.add_edge("plan_reviewer", "plan_approval")
-    builder.add_edge("plan_approval", "budget_gate")
-    builder.add_edge("sourcer", "source_reviewer")
-    builder.add_edge("source_reviewer", "auditor")
-    builder.add_edge("download", "budget_gate")
-    builder.add_edge("explorer", "data_reviewer")
-    builder.add_edge("data_reviewer", "auditor")
-    builder.add_conditional_edges("data_approval", after_data_approval, ["budget_gate", END])
+    builder.add_node("plan", plan)
+    builder.add_node("get_data", get_data)
+    builder.add_node("download", download)
+    builder.add_node("explore", explore)
+    # Each stage ends either approved (go on) or stopped at the budget (end the run)
+    builder.add_edge(START, "plan")
+    builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else "get_data", ["get_data", END])
+    builder.add_conditional_edges("get_data", lambda state: END if state.get("stopped") else "download", ["download", END])
+    builder.add_edge("download", "explore")
+    builder.add_edge("explore", END)
     return builder
 
 
@@ -558,7 +580,7 @@ if __name__ == "__main__":
         prompt = "> " if pause_value["kind"] == "budget" else f"\n{ANSWER_PROMPT}: "
         result = graph.invoke(Command(resume=input(prompt)), config, context=settings)
 
-    status = "approved" if result.get("findings_approved") else "stopped at the budget"
+    status = "stopped at the budget" if result.get("stopped") else "approved"
     log_folder = "practice-runs" if settings.practice else "runs"
     print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). "
           f"Log: {log_folder}/{result['run_id']}/log.md")

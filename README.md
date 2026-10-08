@@ -21,6 +21,10 @@ Enter to revise from the reviewer's critique.
    column" that code answers exactly. It writes findings, citing a look for every number;
    the reviewer critiques them (with looks of its own) and the auditor checks the numbers.
 
+Each stage is the same loop (budget check, worker, reviewer, auditor where there are numbers
+to check, then your approval), so in Studio the run reads plan → get_data → download →
+explore, and each stage opens to show its loop.
+
 The agents decide what matters; the code only answers their questions and checks their
 numbers. Every search, count and look is numbered (L1, L2, ...) so numbers can be traced.
 
