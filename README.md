@@ -28,7 +28,8 @@ python -m cb2.llm
 
 ## Costs
 
-Every model call records its tokens and what it cost (prices in `cb2/costs.py`).
+Every model call records its tokens, how long it took (and so output tokens per
+second) and what it cost (prices in `cb2/costs.py`).
 At each approval pause the run shows this round's cost and the run total. There is
 no limit on revision rounds; instead each run has a budget (default $2, or pass
 `"budget"` in the input). When the next round would go over it, the run pauses and

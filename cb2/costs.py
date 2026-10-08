@@ -30,13 +30,16 @@ def round_cost(costs: list[dict], round_number: int) -> float:
 
 def format_call(call: dict) -> str:
     price = "price unknown" if call["dollars"] is None else f"${call['dollars']:.3f}"
-    cached = f", {call['cache_read_tokens']:,} cached" if call["cache_read_tokens"] else ""
+    # Output tokens per second of the whole call: how fast the answer arrived, waiting included
+    speed = call["output_tokens"] / call["seconds"] if call["seconds"] else 0
     return (f"{call['node']:<10} {call['model']:<18} {price:>14}   "
-            f"{call['input_tokens']:>7,} in{cached}, {call['output_tokens']:>6,} out")
+            f"{call['input_tokens']:>7,} in {call['cache_read_tokens']:>7,} cached {call['output_tokens']:>6,} out   "
+            f"{call['seconds']:>5.1f}s {speed:>5.0f} tok/s")
 
 
 def summary(costs: list[dict], round_number: int, budget: float) -> str:
     lines = [format_call(call) for call in costs if call["round"] == round_number]
-    lines.append(f"This round: ${round_cost(costs, round_number):.3f}   "
+    seconds = sum(call["seconds"] for call in costs if call["round"] == round_number)
+    lines.append(f"This round: ${round_cost(costs, round_number):.3f} in {seconds:.0f}s   "
                  f"Run total: ${spent(costs):.3f} of ${budget:.2f} budget")
     return "\n".join(lines)
