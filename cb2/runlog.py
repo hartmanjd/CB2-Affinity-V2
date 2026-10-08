@@ -1,6 +1,7 @@
 """The run log: a readable record of every round and every answer the lead gave.
 
-Each run gets a folder under runs/ (committed to git) with:
+Each run gets a folder under runs/ (committed to git), or practice-runs/ (git-ignored) when the
+practice setting is on, with:
 - log.md: round by round, what the agents produced, the audit, the costs and the lead's reply
 - ledger.json: every lookup (search, count, look) with its full result
 
@@ -11,7 +12,9 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-RUNS = Path(__file__).resolve().parent.parent / "runs"
+ROOT = Path(__file__).resolve().parent.parent
+RUNS = ROOT / "runs"
+PRACTICE_RUNS = ROOT / "practice-runs"
 
 STAGE_TITLES = {"plan": "Plan", "source": "Get the data", "data": "Explore the data", "budget": "Budget"}
 
@@ -40,7 +43,7 @@ def render(run_id: str, question: str, settings, history: list[dict]) -> str:
 
 
 def write(run_id: str, question: str, settings, history: list[dict], ledger: list[dict]) -> Path:
-    folder = RUNS / run_id
+    folder = (PRACTICE_RUNS if getattr(settings, "practice", False) else RUNS) / run_id
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "log.md").write_text(render(run_id, question, settings, history))
     (folder / "ledger.json").write_text(json.dumps(ledger, indent=1, default=str))

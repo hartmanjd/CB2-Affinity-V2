@@ -27,6 +27,11 @@ numbers. Every search, count and look is numbered (L1, L2, ...) so numbers can b
 Every pause is written to `runs/<run>/log.md`: each round's work, review, audit and costs,
 and what you answered. `runs/<run>/ledger.json` holds every lookup with its full result.
 
+To try things out without adding to the record, tick `practice` (or pass `--practice`): the
+run behaves exactly the same, including real API costs and downloads, but logs to
+`practice-runs/`, which git ignores. A cheap team (e.g. claude-haiku-5-5 planning,
+gpt-6-luna reviewing, a local auditor) keeps practice to fractions of a cent per round.
+
 ## Models
 
 By default **Claude** (claude-opus-5-5) plans, picks the data and explores, **GPT** (gpt-6-astra) reviews,
@@ -39,7 +44,7 @@ Choose per run, with effort levels for Claude and GPT (local models ignore effor
 
 - **LangGraph Studio:** the settings form on the assistant (`planner_model`,
   `planner_effort`, `reviewer_model`, `reviewer_effort`, `auditor_model`, `max_lookups`,
-  `fresh_download`). Save combinations as assistants, e.g. a local-only team.
+  `fresh_download`, `practice`). Save combinations as assistants, e.g. a local-only team.
 - **Terminal:** `python -m cb2.graph --planner-model gemma4:26b --reviewer-effort high --budget 0.50`
 
 ## Setup
