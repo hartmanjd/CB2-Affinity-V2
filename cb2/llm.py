@@ -1,4 +1,7 @@
-"""Helpers for asking Claude and local Ollama models a question."""
+"""Helpers for asking Claude, OpenAI and local Ollama models a question.
+
+Each helper returns the answer text and a usage record: the model, its token counts and
+what the call cost in dollars."""
 
 import os
 
@@ -6,6 +9,8 @@ import anthropic
 import ollama
 import openai
 from dotenv import load_dotenv
+
+from cb2.costs import dollars
 
 load_dotenv()
 
@@ -16,7 +21,19 @@ OLLAMA_MODEL = "gemma4:26b"
 OLLAMA_CONTEXT = 8192
 
 
-def ask_claude(prompt: str, model: str = CLAUDE_MODEL, max_tokens: int = 16000) -> str:
+def usage_record(model: str, input_tokens: int, output_tokens: int,
+                 cache_read_tokens: int = 0, cache_write_tokens: int = 0, local: bool = False) -> dict:
+    return {
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "dollars": 0.0 if local else dollars(model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens),
+    }
+
+
+def ask_claude(prompt: str, model: str = CLAUDE_MODEL, max_tokens: int = 16000) -> tuple[str, dict]:
     # If a safety filter declines the request, retry it on Anthropic's recommended fallback model
     response = anthropic.Anthropic().beta.messages.create(
         model=model,
@@ -32,10 +49,15 @@ def ask_claude(prompt: str, model: str = CLAUDE_MODEL, max_tokens: int = 16000) 
     text = "".join(block.text for block in response.content if block.type == "text")
     if not text:
         raise RuntimeError(f"Claude returned no answer text (stop_reason: {response.stop_reason})")
-    return text
+    # response.model is whichever model answered; after a fallback, a declined first attempt isn't counted
+    usage = response.usage
+    return text, usage_record(
+        response.model, usage.input_tokens, usage.output_tokens,
+        usage.cache_read_input_tokens or 0, usage.cache_creation_input_tokens or 0,
+    )
 
 
-def ask_openai(prompt: str, model: str = OPENAI_MODEL, max_tokens: int = 16000) -> str:
+def ask_openai(prompt: str, model: str = OPENAI_MODEL, max_tokens: int = 16000) -> tuple[str, dict]:
     response = openai.OpenAI().responses.create(model=model, input=prompt, max_output_tokens=max_tokens)
     if response.status != "completed":
         reason = response.incomplete_details.reason if response.incomplete_details else None
@@ -46,10 +68,13 @@ def ask_openai(prompt: str, model: str = OPENAI_MODEL, max_tokens: int = 16000) 
         raise RuntimeError(f"OpenAI declined the request: {refusals[0]}")
     if not response.output_text:
         raise RuntimeError("OpenAI returned no answer text")
-    return response.output_text
+    # OpenAI counts cached tokens inside input_tokens, so take them out to price them separately
+    usage = response.usage
+    cached = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else 0
+    return response.output_text, usage_record(model, usage.input_tokens - cached, usage.output_tokens, cached)
 
 
-def ask_ollama(prompt: str, model: str = OLLAMA_MODEL, schema: dict | None = None) -> str:
+def ask_ollama(prompt: str, model: str = OLLAMA_MODEL, schema: dict | None = None) -> tuple[str, dict]:
     # A schema makes the model answer in JSON of that exact shape
     client = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://localhost:11434"))
     response = client.chat(
@@ -63,11 +88,13 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL, schema: dict | None = Non
             f"{model} returned no answer text (done_reason: {response.done_reason}, "
             f"prompt tokens: {response.prompt_eval_count}, context: {OLLAMA_CONTEXT})"
         )
-    return response.message.content
+    # Local models cost nothing, but the token counts still show how much work they did
+    usage = usage_record(model, response.prompt_eval_count or 0, response.eval_count or 0, local=True)
+    return response.message.content, usage
 
 
 if __name__ == "__main__":
     question = "In two sentences, what is the CB2 receptor?"
-    print("Claude:\n" + ask_claude(question))
-    print("\nOpenAI:\n" + ask_openai(question))
-    print("\nOllama:\n" + ask_ollama(question))
+    for name, ask in [("Claude", ask_claude), ("OpenAI", ask_openai), ("Ollama", ask_ollama)]:
+        text, usage = ask(question)
+        print(f"{name}:\n{text}\n{usage}\n")
