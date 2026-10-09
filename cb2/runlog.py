@@ -37,8 +37,13 @@ def render(run_id: str, question: str, settings, history: list[dict]) -> str:
             # Tables and cost lines keep their columns in a code block
             lines += ["```", text, "```", ""] if heading in ("Costs", "Audit", "Lookups") else [text, ""]
         reply = item["feedback"]
-        lines += ["### Lead", "", "*(waiting for the lead)*" if reply is None else
-                  "> " + (reply or "(blank: revise from the review)").replace("\n", "\n> "), ""]
+        if reply is None:
+            shown = "*(waiting for the lead)*"
+        elif item["stage"] != "budget" and reply.lower() in ("stop", "end"):
+            shown = f"> {reply}\n\n*(the lead stopped the run here)*"
+        else:
+            shown = "> " + (reply or "(blank: revise from the review)").replace("\n", "\n> ")
+        lines += ["### Lead", "", shown, ""]
     return "\n".join(lines)
 
 

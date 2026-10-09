@@ -115,9 +115,12 @@ The planner's summary:
 The planner's searches and counts, with their results:
 {lookups}
 
-You can make up to {max_lookups} searches and counts of your own. Then list the three most
-important problems with what is proposed (or left out), one or two sentences each. Cite results
-in brackets, like [L3], for any numbers."""
+The plan has already been approved, so don't review it again. Review the download proposal:
+whether these targets are the right data for the question and the plan, and whether anything
+the plan needs is left out or anything included doesn't belong. You can make up to
+{max_lookups} searches and counts of your own. Then list the three most important problems
+with what is proposed (or left out), one or two sentences each. Cite results in brackets, like
+[L3], for any numbers."""
 
 EXPLORE_PROMPT = """You are the planner of a small study using data from ChEMBL, analysed in Python.
 
@@ -184,7 +187,10 @@ REVIEWER_LOOKUPS = 5
 
 # Used when the lead leaves the answer blank: revise from the critique alone
 NO_FEEDBACK = "None given. Address the most important points of the critique."
-ANSWER_PROMPT = "Type 'approve', write feedback, or press Enter to revise from the review"
+ANSWER_PROMPT = ("Type 'approve' to go on, write feedback (or leave it blank to revise from the review) "
+                 "for another round, or 'stop' to end the run")
+# Answers at an approval pause that end the run
+STOP_WORDS = ("stop", "end")
 
 
 ModelName = Literal[tuple(MODELS)]
@@ -261,13 +267,16 @@ def cost_record(node: str, state: State, usage: dict) -> dict:
     return {"node": node, "stage": state["stage"], "round": state["round"], **usage}
 
 
-def pause(state: State, runtime: Runtime[Settings], kind: str, sections: dict[str, str]) -> tuple[str, dict]:
-    """Show sections to the lead and wait for an answer; log the round before and after."""
+def pause(state: State, runtime: Runtime[Settings], kind: str, sections: dict[str, str],
+          how_to_answer: str | None = None) -> tuple[str, dict]:
+    """Show sections to the lead and wait for an answer; log the round before and after.
+    how_to_answer is shown with the pause but not written to the log."""
     item = runlog.entry(kind, state.get("round", 0), list(sections.items()))
     history = state.get("history", [])
     args = (state["run_id"], state["question"], runtime.context or Settings())
     runlog.write(*args, history + [item], state.get("ledger", []))
-    answer = str(interrupt({"kind": kind, **sections}) or "").strip()
+    shown = {"kind": kind, **sections, **({"How to answer": how_to_answer} if how_to_answer else {})}
+    answer = str(interrupt(shown) or "").strip()
     item["feedback"] = answer
     runlog.write(*args, history + [item], state.get("ledger", []))
     return answer, item
@@ -320,7 +329,9 @@ def make_approval(stage: str, feedback_key: str, sections, not_ready=lambda stat
     """not_ready(state) can return a reason the lead can't approve yet; it becomes the feedback."""
     def approval(state: State, runtime: Runtime[Settings]) -> dict:
         answer, item = pause(state, runtime, stage, {
-            **sections(state), "Costs": summary(state["costs"], state["round"], state["budget"])})
+            **sections(state), "Costs": summary(state["costs"], state["round"], state["budget"])}, ANSWER_PROMPT)
+        if answer.lower() in STOP_WORDS:
+            return {feedback_key: answer, "approved": False, "stopped": True, "history": [item]}
         approved = answer.lower() == "approve"
         reason = not_ready(state) if approved else None
         if reason:
@@ -346,9 +357,9 @@ def make_stage(stage: str, worker, reviewer, feedback_key: str, show, audit_sect
         builder.add_edge("auditor", "approval")
     else:
         builder.add_edge("reviewer", "approval")
-    # Approved: the stage is done. Otherwise go round again, budget permitting
-    builder.add_conditional_edges("approval", lambda state: END if state["approved"] else "budget_gate",
-                                  ["budget_gate", END])
+    # Approved or stopped: the stage is done. Otherwise go round again, budget permitting
+    builder.add_conditional_edges("approval", lambda state: END if state["approved"] or state.get("stopped")
+                                  else "budget_gate", ["budget_gate", END])
     return builder.compile()
 
 
@@ -542,6 +553,7 @@ def make_builder() -> StateGraph:
     builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else "get_data", ["get_data", END])
     builder.add_conditional_edges("get_data", lambda state: END if state.get("stopped") else "download", ["download", END])
     builder.add_edge("download", "explore")
+    # (explore is the last stage, so approved or stopped, the run ends there)
     builder.add_edge("explore", END)
     return builder
 
@@ -575,12 +587,12 @@ if __name__ == "__main__":
     while "__interrupt__" in result:
         pause_value = result["__interrupt__"][0].value
         for heading, text in pause_value.items():
-            if heading != "kind":
+            if heading not in ("kind", "How to answer"):
                 print(f"\n=== {heading.upper()} ===\n{text}")
         prompt = "> " if pause_value["kind"] == "budget" else f"\n{ANSWER_PROMPT}: "
         result = graph.invoke(Command(resume=input(prompt)), config, context=settings)
 
-    status = "stopped at the budget" if result.get("stopped") else "approved"
+    status = "stopped" if result.get("stopped") else "approved"
     log_folder = "practice-runs" if settings.practice else "runs"
     print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). "
           f"Log: {log_folder}/{result['run_id']}/log.md")
