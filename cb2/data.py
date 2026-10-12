@@ -2,9 +2,9 @@
 
 Every activity record for each approved target is kept, with the details of its assay and
 target; nothing is filtered. Each download is saved in its own folder under data/raw, with a
-manifest recording the ChEMBL release, the approved proposal, row counts and file checksums."""
+manifest recording the ChEMBL release, the approved proposal, row counts and file checksums.
+A download is checked against its manifest every time it is loaded."""
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from functools import cache
@@ -12,13 +12,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from cb2.checks import sha256, verify_download
 from cb2.chembl import describe_targets, get, get_all
 
 RAW = Path(__file__).resolve().parent.parent / "data" / "raw"
-
-
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def download(target_ids: list[str], reason: str = "", run_id: str = "") -> Path:
@@ -28,9 +25,14 @@ def download(target_ids: list[str], reason: str = "", run_id: str = "") -> Path:
     print(f"ChEMBL {status['chembl_db_version']}: downloading {joined}")
     activities = get_all("activity", "activities", target_chembl_id__in=joined)
     assays = get_all("assay", "assays", target_chembl_id__in=joined)
-
-    # The raw responses are saved unchanged; the table is built from them
     folder = RAW / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    save(folder, status, targets, activities, assays, {"target_ids": target_ids, "reason": reason}, run_id)
+    return folder
+
+
+def save(folder: Path, status: dict, targets: list[dict], activities: list[dict], assays: list[dict],
+         proposal: dict, run_id: str = "") -> None:
+    # The raw responses are saved unchanged; the table is built from them
     folder.mkdir(parents=True)
     for name, records in [("targets", targets), ("activities", activities), ("assays", assays)]:
         (folder / f"{name}.json").write_text(json.dumps(records))
@@ -42,7 +44,7 @@ def download(target_ids: list[str], reason: str = "", run_id: str = "") -> Path:
         "chembl_version": status["chembl_db_version"],
         "chembl_release_date": status["chembl_release_date"],
         "run": run_id,
-        "proposal": {"target_ids": target_ids, "reason": reason},
+        "proposal": proposal,
         "targets": [{key: target[key] for key in ("target_chembl_id", "pref_name", "organism", "target_type")}
                     for target in targets],
         "rows": {"activities": len(activities), "assays": len(assays), "table": len(table)},
@@ -51,7 +53,6 @@ def download(target_ids: list[str], reason: str = "", run_id: str = "") -> Path:
     # Written last, so a folder without a manifest is an unfinished download
     (folder / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"Saved {len(table):,} rows to {folder}")
-    return folder
 
 
 def scalars(record: dict) -> dict:
@@ -83,8 +84,8 @@ def find_download(target_ids: list[str]) -> Path | None:
 
 @cache
 def load(folder: str) -> pd.DataFrame:
-    # Cached, so every look in a run reads the file only once
-    return pd.read_csv(Path(folder) / "table.csv.gz", low_memory=False)
+    # Cached, so every look in a run reads (and checks) the download only once
+    return verify_download(Path(folder))
 
 
 if __name__ == "__main__":

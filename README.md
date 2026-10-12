@@ -73,6 +73,17 @@ the ChEMBL release and the proposal that was approved. A later run that approves
 the same targets reuses the download unless `fresh_download` is set. To download targets
 yourself: `python -m cb2.data CHEMBL...`
 
+A download is checked every time it is loaded: every file must match the checksum in its
+manifest, the row counts must match, and no activity record may appear twice. If anything is
+off, the run stops and lists what is wrong. To check a download yourself:
+`python -m cb2.checks data/raw/<folder>`
+
+## Tests
+
+Run `pytest` (no API keys or internet needed). Each test breaks a small made-up download in one
+way on purpose (a changed file, a repeated record, a wrong row count, ...) and checks that the
+checks catch it.
+
 ## Costs
 
 Every model call records its tokens, how long it took (and so output tokens per
