@@ -6,3 +6,4 @@ langgraph>=1.2
 langgraph-cli[inmem]>=0.4
 pandas>=3.0
 requests>=2.34
+pytest>=9.0
