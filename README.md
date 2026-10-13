@@ -78,11 +78,40 @@ manifest, the row counts must match, and no activity record may appear twice. If
 off, the run stops and lists what is wrong. To check a download yourself:
 `python -m cb2.checks data/raw/<folder>`
 
+## Cleaning
+
+Cleaning turns a download into one row per compound with one value: pChEMBL, which is
+-log10 of the value in molar (so pKi for Ki records). A **recipe** picks settings from a fixed
+menu; the steps, their order, the unit conversion and the bookkeeping are fixed in
+`cb2/clean.py`:
+
+```json
+{"targets": ["CHEMBL253"], "types": ["Ki"], "min_confidence": 9, "drop_flagged": true,
+ "combine": "median", "max_spread": 1.0}
+```
+
+1. keep the chosen targets
+2. keep the chosen measurement types (from Ki, Kd, IC50)
+3. keep binding assays, at or above the minimum assay confidence (none, 8 or 9)
+4. drop records ChEMBL flags (validity warnings, potential duplicates), if chosen
+5. keep exact values (drops censored ones such as "> 10,000 nM")
+6. keep usable values (a value in nM above zero, a structure and a parent compound)
+7. combine repeat measurements of each parent compound (median or mean), dropping compounds
+   whose measurements are further apart than `max_spread` log units (0.5, 1.0, 1.5, or none)
+
+`python -m cb2.clean data/raw/<folder> recipe.json` (or `--dry-run` to only see the counts)
+saves `data/clean/<timestamp>/` with `clean.csv`, `dropped.csv` (every removed record, with
+its step and reason) and a manifest of the source download, recipe, code version, step-by-step
+counts and checksums. Before saving, the code checks that every record is either kept or dropped
+exactly once, that every step's counts add up, and that every value is between 2 and 12 and
+agrees with ChEMBL's own `pchembl_value`.
+
 ## Tests
 
-Run `pytest` (no API keys or internet needed). Each test breaks a small made-up download in one
-way on purpose (a changed file, a repeated record, a wrong row count, ...) and checks that the
-checks catch it.
+Run `pytest` (no API keys or internet needed). The cleaning tests use a small made-up table
+whose right answers were worked out by hand. Other tests break a download or the cleaning
+bookkeeping on purpose (a changed file, a repeated record, a lost dropped row, a value off the
+menu, ...) and check that the checks catch it.
 
 ## Costs
 
