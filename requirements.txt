@@ -7,3 +7,4 @@ langgraph-cli[inmem]>=0.4
 pandas>=3.0
 requests>=2.34
 pytest>=9.0
+rdkit>=2026.9
