@@ -7,8 +7,14 @@ Stage 3, explore the data: the planner explores the download with looks and writ
 the reviewer checks them (with looks of its own) and the auditor checks every number.
 Stage 4, clean the data: the planner chooses a cleaning recipe from a fixed menu, trying settings
 with dry runs; the reviewer critiques it (with dry runs of its own) and the auditor checks every
-number. Once the lead approves, code makes the dataset.
-Every stage is the same loop, built once by make_stage and used four times as a subgraph:
+number. Once the lead approves, code makes the dataset, then standardizes and splits its molecules.
+Stage 5, choose the models: the planner chooses the features, a classifier and a regressor from
+the menu, comparing practice scores on the training part; the reviewer critiques the choice (with
+tries of its own) and the auditor checks every number. Once the lead approves, code trains the
+models and scores them once on the test part.
+Stage 6, conclusions: the planner writes what the test scores say; the reviewer critiques it and
+the auditor checks every number against the scores.
+Every stage is the same loop, built once by make_stage and used six times as a subgraph:
 budget check → worker → reviewer → (auditor) → the lead's approval → back round, or on to the
 next stage. Every pause is written to the run log in runs/."""
 
@@ -25,9 +31,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
-from cb2 import chembl, clean, data, runlog
+from cb2 import chembl, clean, data, runlog, split, train
 from cb2.audit import audit
 from cb2.costs import round_cost, spent, summary
+from cb2.features import FEATURES
 from cb2.llm import EFFORTS, MODELS, ask, ask_with_tools, check_model
 from cb2.looks import LOOK_TOOL, LookError, look, overview
 
@@ -261,6 +268,154 @@ recipe: whether each setting suits the question and the plan, and what it costs 
 make up to {max_lookups} tries and looks of your own. Then list the three most important problems
 with the recipe, one or two sentences each. Cite results in brackets, like [L3], for any numbers."""
 
+MODEL_PROMPT = """You are the planner of a small study using data from ChEMBL, analysed in Python.
+
+Research question: {question}
+
+The approved research plan:
+{plan}
+
+The approved dataset has one pKi value per compound. Code has standardized the molecules and
+split them; the scaffold split is the headline, the random split is for comparison:
+{split}
+
+Next, choose how to model it. Code trains two separate models: a classifier (active means
+pKi >= {active_at:g}) and a regressor that predicts pKi. You choose:
+- the features, one of:
+{features}
+- the classifier and the regressor: any scikit-learn model on this menu, with settings to try
+  (at most {max_settings} combinations each; settings you leave out keep the model's defaults):
+{menu}
+
+Fixed by code: the splits and folds, the seed, how the features are prepared (missing values
+filled with the training median, then scaled), the metrics, the baselines and the test part. Code
+picks each model's settings by practice {pick}, and also checks the classifier at pKi
+{sensitivity} with the settings chosen at {active_at:g}.
+
+Use try_models to get practice scores for a model and its settings (cross-validation on the
+training part of the scaffold split), next to the baselines; you can make up to {max_lookups}
+tries. Each try may take at most {try_minutes:g} minutes on this computer; one that would take
+longer is stopped early, so when two choices score about the same, prefer the faster one. When you
+have decided, call propose_models with your choices and reasons. Then write a short summary for the
+project lead: what you chose, how it compares with the alternatives you
+tried and with the baselines, and why.
+
+Whenever you state a number from a try or the split, cite it in brackets, like [L3].
+Keep the summary under 300 words."""
+
+MODEL_REVISION_PROMPT = MODEL_PROMPT + """
+
+Your previous proposal:
+{models}
+
+Your previous summary:
+{summary}
+
+Tries made so far (you can repeat or extend them):
+{lookup_list}
+
+A reviewer's critique of the proposal:
+{review}
+
+The auditor's check of the numbers in it:
+{audit}
+
+Feedback from the project lead:
+{feedback}
+
+Make an improved proposal (call propose_models again) that addresses the lead's feedback and the
+points of the critique you judge most important, and write a new summary. If a point in the
+critique is wrong, don't follow it; say so in a short note at the end."""
+
+MODEL_REVIEWER_PROMPT = """You are a critical reviewer of studies that use ChEMBL data.
+
+Question: {question}
+
+Plan:
+{plan}
+
+The dataset and its split:
+{split}
+
+The planner proposes these features and models, chosen on practice scores (cross-validation on the
+training part of the scaffold split). Code computed the practice scores shown:
+{models}
+
+The planner's summary:
+{summary}
+
+The planner's tries, with their results:
+{lookups}
+
+The plan and the dataset have already been approved, so don't review them again. Review the choice
+of features and models: whether the practice scores support it, whether it beats the baselines by
+enough to matter, and whether a better option was missed. You can make up to {max_lookups} tries
+of your own. Then list the three most important problems with the choice, one or two sentences
+each. Cite results in brackets, like [L3], for any numbers."""
+
+RESULTS_PROMPT = """You are the planner of a small study using data from ChEMBL, analysed in Python.
+
+Research question: {question}
+
+The approved research plan:
+{plan}
+
+The approved features and models:
+{models}
+
+Code trained them on the whole training part and scored them once on the test part, which nothing
+was tuned on. The scaffold split is the headline: its test part holds whole families of molecules
+the models never saw. The random split is for comparison. The test scores, each with its 95%
+bootstrap interval, next to the baselines:
+{scores}
+
+Write the conclusions for the project lead:
+1. What the results say about the research question, and how sure we can be.
+2. How the models compare with the baselines, and the scaffold split with the random split.
+3. The main limitations.
+
+Only quote numbers from the scores above or the practice scores, and cite them in brackets, like
+[L3]. Keep the conclusions under 400 words."""
+
+RESULTS_REVISION_PROMPT = RESULTS_PROMPT + """
+
+Your previous conclusions:
+{conclusions}
+
+A reviewer's critique of them:
+{review}
+
+The auditor's check of the numbers in them:
+{audit}
+
+Feedback from the project lead:
+{feedback}
+
+Write improved conclusions that address the lead's feedback, the points of the critique you judge
+most important and any numbers the auditor could not confirm. If a point in the critique is
+wrong, don't follow it; say so in a short note at the end."""
+
+RESULTS_REVIEWER_PROMPT = """You are a critical reviewer of studies that use ChEMBL data.
+
+Question: {question}
+
+Plan:
+{plan}
+
+The approved features and models:
+{models}
+
+Their test scores, each with its 95% bootstrap interval, next to the baselines:
+{scores}
+
+The planner's conclusions:
+{conclusions}
+
+The models have already been chosen and tested, so don't review that choice. Review the
+conclusions: whether each one follows from the scores and their intervals, and what is overclaimed
+or missing. List the three most important problems, one or two sentences each. Cite the scores in
+brackets, like [L3], for any numbers."""
+
 # Dollars a run may spend before it pauses to ask for more; pass "budget" in the input to change it
 DEFAULT_BUDGET = 2.00
 REVIEWER_LOOKUPS = 5
@@ -293,6 +448,8 @@ class Settings:
     fresh_download: bool = False
     # Practice runs log to practice-runs/ (git-ignored) instead of runs/, so they stay out of the record
     practice: bool = False
+    # The longest one try of models may take; a try that would run longer is stopped early
+    max_try_minutes: float = train.TRY_MINUTES
 
 
 def effort(value: str) -> str | None:
@@ -313,7 +470,7 @@ def grow(existing: list, new: list) -> list:
 class State(TypedDict, total=False):
     question: str
     run_id: str
-    stage: Literal["plan", "source", "data", "clean"]
+    stage: Literal["plan", "source", "data", "clean", "model", "results"]
     # Counts rounds across all stages; every cost record says which round it belongs to
     round: int
     budget: float
@@ -346,6 +503,19 @@ class State(TypedDict, total=False):
     clean_review: str
     clean_feedback: str
     clean_folder: str
+    split_folder: str
+    split_id: str
+    # Stage 5: choose the models
+    models: dict
+    models_summary: str
+    models_review: str
+    models_feedback: str
+    models_folder: str
+    scores_id: str
+    # Stage 6: conclusions
+    conclusions: str
+    conclusions_review: str
+    results_feedback: str
 
 
 
@@ -449,8 +619,8 @@ def make_stage(stage: str, worker, reviewer, feedback_key: str, show, audit_sect
     return builder.compile()
 
 
-def lookup_runner(state: State, ledger: list[dict], by: str):
-    """A run_tool function for ask_with_tools: runs searches, counts and looks, numbering each
+def lookup_runner(state: State, ledger: list[dict], by: str, try_minutes: float | None = None):
+    """A run_tool function for ask_with_tools: runs searches, counts, looks and tries, numbering each
     and adding it to ledger. A failed lookup tells the agent what went wrong instead of stopping."""
     def run(name: str, request: dict) -> str:
         look_id = f"L{len(ledger) + 1}"
@@ -464,6 +634,8 @@ def lookup_runner(state: State, ledger: list[dict], by: str):
                 entry = look(data.load(state["data_folder"]), request, look_id)
             elif name == "try_recipe":
                 entry = clean.try_recipe(data.load(state["data_folder"]), request, look_id)
+            elif name == "try_models":
+                entry = train.try_models(Path(state["split_folder"]), request, look_id, try_minutes)
             else:
                 return f"Unknown tool {name!r}."
         except (ValueError, LookError) as error:
@@ -682,6 +854,14 @@ def clean_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
             "costs": [cost_record("reviewer", state, usage)]}
 
 
+def record(state: State, runtime: Runtime[Settings], kind: str, sections: list, new_entries=()) -> dict:
+    """Log a step code takes after the lead's approval."""
+    item = runlog.entry(kind, state["round"], sections)
+    runlog.write(state["run_id"], state["question"], runtime.context or Settings(),
+                 state.get("history", []) + [item], state.get("ledger", []) + list(new_entries))
+    return item
+
+
 def make_dataset(state: State, runtime: Runtime[Settings]) -> dict:
     """Code, not an agent: make the dataset from the approved recipe, check it and save it."""
     table = data.load(state["data_folder"])
@@ -689,10 +869,131 @@ def make_dataset(state: State, runtime: Runtime[Settings]) -> dict:
     result = clean.run(table, recipe)
     folder = clean.save(result, Path(state["data_folder"]), recipe, state["recipe"]["reason"], state["run_id"])
     text = f"Saved {len(result.clean):,} compounds to {clean.shown(folder)}\n\n{clean.waterfall_text(result.waterfall)}"
-    item = runlog.entry("dataset", state["round"], [("Steps", text)])
-    runlog.write(state["run_id"], state["question"], runtime.context or Settings(),
-                 state.get("history", []) + [item], state.get("ledger", []))
-    return {"clean_folder": str(folder), "history": [item]}
+    return {"clean_folder": str(folder), "history": [record(state, runtime, "dataset", [("Steps", text)])]}
+
+
+def make_split(state: State, runtime: Runtime[Settings]) -> dict:
+    """Code, not an agent: standardize the dataset's molecules and split them, the same way every time."""
+    source = Path(state["clean_folder"])
+    table, manifest = split.load_clean(source)
+    molecules, dropped = split.prepare(table, manifest["recipe"]["max_spread"])
+    splits = split.make_splits(molecules)
+    folder = split.save(splits, dropped, source, state["run_id"])
+    entry = {**split.summary_entry(splits, dropped, len(table), f"L{len(state['ledger']) + 1}"),
+             "by": "split", "round": state["round"]}
+    item = record(state, runtime, "split", [("Steps", f"Saved to {clean.shown(folder)}\n\n{entry['text']}")], [entry])
+    return {"split_folder": str(folder), "split_id": entry["id"], "ledger": [entry], "history": [item]}
+
+
+# --- Stage 5: choose the models ---
+
+def entry_text(state: State, entry_id: str) -> str:
+    return next(entry["text"] for entry in state["ledger"] if entry["id"] == entry_id)
+
+
+def format_models(models: dict | None) -> str:
+    if not models:
+        return "(no models proposed)"
+    chosen = "\n".join(f"{task}: {models[task]['model']}, settings to try {json.dumps(models[task]['settings'])}"
+                       for task in train.PICK_BY)
+    return f"features: {models['features']}\n{chosen}\nReason: {models['reason']}\n\n{models['practice']}"
+
+
+def about_modeling(state: State) -> dict:
+    return {"question": state["question"], "plan": state["plan"], "split": entry_text(state, state["split_id"])}
+
+
+def modeler(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    state = {**state, "round": state["round"] + 1}
+    ledger = list(state["ledger"])
+    run_lookup = lookup_runner(state, ledger, "modeler", settings.max_try_minutes)
+    proposal = {}
+
+    def run(name: str, request: dict) -> str:
+        if name != "propose_models":
+            return run_lookup(name, request)
+        try:
+            proposal.update(train.propose(Path(state["split_folder"]), request, settings.max_try_minutes))
+        except train.ChoiceError as error:
+            return f"Not proposed: {error}"
+        return "Models recorded:\n" + format_models(proposal) + "\nNow write your summary for the lead."
+
+    fields = dict(**about_modeling(state), active_at=split.ACTIVE_AT, max_settings=train.MAX_SETTINGS,
+                  features="\n".join(f"  {name}: {description}" for name, (description, _) in FEATURES.items()),
+                  menu=train.menu_text(), pick=" and ".join(metric for metric, _ in train.PICK_BY.values()),
+                  sensitivity=" and ".join(f"{cutoff:g}" for cutoff in train.SENSITIVITY),
+                  max_lookups=settings.max_lookups, try_minutes=settings.max_try_minutes)
+    if "models_summary" not in state:
+        prompt = MODEL_PROMPT.format(**fields)
+    else:
+        prompt = MODEL_REVISION_PROMPT.format(
+            **fields, models=format_models(state.get("models")), summary=state["models_summary"],
+            lookup_list=lookup_list(ledger, {"try_models"}), review=state["models_review"],
+            audit=state["audit_report"], feedback=state["models_feedback"] or NO_FEEDBACK,
+        )
+    summary_text, usage = ask_with_tools(prompt, settings.planner_model, effort(settings.planner_effort),
+                                         [train.TRY_TOOL, train.PROPOSE_TOOL], run, settings.max_lookups,
+                                         uncounted=("propose_models",))
+    return {"models_summary": summary_text, "models": proposal or state.get("models") or {},
+            "round": state["round"], "ledger": ledger[len(state["ledger"]):],
+            "costs": [cost_record("modeler", state, usage)]}
+
+
+def model_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    ledger = list(state["ledger"])
+    this_round = [entry["text"] for entry in ledger if entry.get("by") == "modeler" and entry["round"] == state["round"]]
+    prompt = MODEL_REVIEWER_PROMPT.format(**about_modeling(state), models=format_models(state["models"]),
+                                          summary=state["models_summary"], lookups="\n\n".join(this_round) or "(none)",
+                                          max_lookups=REVIEWER_LOOKUPS)
+    review, usage = ask_with_tools(prompt, settings.reviewer_model, effort(settings.reviewer_effort),
+                                   [train.TRY_TOOL], lookup_runner(state, ledger, "reviewer", settings.max_try_minutes),
+                                   REVIEWER_LOOKUPS)
+    return {"models_review": review, "ledger": ledger[len(state["ledger"]):],
+            "costs": [cost_record("reviewer", state, usage)]}
+
+
+def train_and_test(state: State, runtime: Runtime[Settings]) -> dict:
+    """Code, not an agent: train the approved models, score them once on the test part and save them."""
+    folder, models = Path(state["split_folder"]), state["models"]
+    table, _ = train.load_split(folder)
+    classifier, regressor = train.choices(models)
+    uses = train.count_test_uses(folder)
+    results, predictions, fitted = train.evaluate(table, folder, models["features"], classifier, regressor)
+    saved = train.save(results, predictions, fitted, folder, models["features"], classifier, regressor, uses,
+                       state["run_id"], models["reason"])
+    entry = {**train.scores_entry(results, f"L{len(state['ledger']) + 1}"), "by": "train_and_test",
+             "round": state["round"]}
+    item = record(state, runtime, "models", [("Scores", f"Saved to {clean.shown(saved)}\n\n{entry['text']}")], [entry])
+    return {"models_folder": str(saved), "scores_id": entry["id"], "ledger": [entry], "history": [item]}
+
+
+# --- Stage 6: conclusions ---
+
+def about_results(state: State) -> dict:
+    return {"question": state["question"], "plan": state["plan"], "models": format_models(state["models"]),
+            "scores": entry_text(state, state["scores_id"])}
+
+
+def writer(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    state = {**state, "round": state["round"] + 1}
+    if "conclusions" not in state:
+        prompt = RESULTS_PROMPT.format(**about_results(state))
+    else:
+        prompt = RESULTS_REVISION_PROMPT.format(
+            **about_results(state), conclusions=state["conclusions"], review=state["conclusions_review"],
+            audit=state["audit_report"], feedback=state["results_feedback"] or NO_FEEDBACK)
+    conclusions, usage = ask(prompt, settings.planner_model, effort(settings.planner_effort))
+    return {"conclusions": conclusions, "round": state["round"], "costs": [cost_record("writer", state, usage)]}
+
+
+def results_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    prompt = RESULTS_REVIEWER_PROMPT.format(**about_results(state), conclusions=state["conclusions"])
+    review, usage = ask(prompt, settings.reviewer_model, effort(settings.reviewer_effort))
+    return {"conclusions_review": review, "costs": [cost_record("reviewer", state, usage)]}
 
 
 def make_builder() -> StateGraph:
@@ -719,6 +1020,18 @@ def make_builder() -> StateGraph:
         audit_sections=lambda state: {"Summary": f"{state['recipe'].get('reason', '')}\n{state['recipe_summary']}",
                                       "Review": state["clean_review"]},
         not_ready=lambda state: None if state["recipe"] else "You haven't proposed a recipe yet. Call propose_recipe.")
+    choose_models = make_stage(
+        "model", modeler, model_reviewer, "models_feedback",
+        show=lambda state: {"Models": format_models(state["models"]), "Summary": state["models_summary"],
+                            "Review": state["models_review"], "Audit": state["audit_report"]},
+        audit_sections=lambda state: {"Summary": f"{state['models'].get('reason', '')}\n{state['models_summary']}",
+                                      "Review": state["models_review"]},
+        not_ready=lambda state: None if state["models"] else "You haven't proposed models yet. Call propose_models.")
+    conclude = make_stage(
+        "results", writer, results_reviewer, "results_feedback",
+        show=lambda state: {"Conclusions": state["conclusions"], "Review": state["conclusions_review"],
+                            "Audit": state["audit_report"]},
+        audit_sections=lambda state: {"Conclusions": state["conclusions"], "Review": state["conclusions_review"]})
 
     builder = StateGraph(State, context_schema=Settings)
     builder.add_node("plan", plan)
@@ -727,6 +1040,10 @@ def make_builder() -> StateGraph:
     builder.add_node("explore", explore)
     builder.add_node("clean", clean_data)
     builder.add_node("make_dataset", make_dataset)
+    builder.add_node("make_split", make_split)
+    builder.add_node("model", choose_models)
+    builder.add_node("train_and_test", train_and_test)
+    builder.add_node("results", conclude)
     # Each stage ends either approved (go on) or stopped at the budget (end the run)
     builder.add_edge(START, "plan")
     builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else "get_data", ["get_data", END])
@@ -735,7 +1052,12 @@ def make_builder() -> StateGraph:
     builder.add_conditional_edges("explore", lambda state: END if state.get("stopped") else "clean", ["clean", END])
     builder.add_conditional_edges("clean", lambda state: END if state.get("stopped") else "make_dataset",
                                   ["make_dataset", END])
-    builder.add_edge("make_dataset", END)
+    builder.add_edge("make_dataset", "make_split")
+    builder.add_edge("make_split", "model")
+    builder.add_conditional_edges("model", lambda state: END if state.get("stopped") else "train_and_test",
+                                  ["train_and_test", END])
+    builder.add_edge("train_and_test", "results")
+    builder.add_edge("results", END)
     return builder
 
 
@@ -756,10 +1078,12 @@ if __name__ == "__main__":
     parser.add_argument("--max-lookups", type=int, default=Settings.max_lookups)
     parser.add_argument("--fresh-download", action="store_true")
     parser.add_argument("--practice", action="store_true", help="log to practice-runs/, which git ignores")
+    parser.add_argument("--max-try-minutes", type=float, default=Settings.max_try_minutes)
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
     args = parser.parse_args()
     settings = Settings(args.planner_model, args.planner_effort, args.reviewer_model, args.reviewer_effort,
-                        args.auditor_model, args.max_lookups, args.fresh_download, args.practice)
+                        args.auditor_model, args.max_lookups, args.fresh_download, args.practice,
+                        args.max_try_minutes)
 
     graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}
@@ -777,5 +1101,6 @@ if __name__ == "__main__":
     log_folder = "practice-runs" if settings.practice else "runs"
     print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). "
           f"Log: {log_folder}/{result['run_id']}/log.md")
-    if result.get("clean_folder"):
-        print(f"Dataset: {result['clean_folder']}")
+    for name, key in [("Dataset", "clean_folder"), ("Split", "split_folder"), ("Models", "models_folder")]:
+        if result.get(key):
+            print(f"{name}: {result[key]}")

@@ -17,9 +17,12 @@ RUNS = ROOT / "runs"
 PRACTICE_RUNS = ROOT / "practice-runs"
 
 STAGE_TITLES = {"plan": "Plan", "source": "Get the data", "data": "Explore the data", "clean": "Clean the data",
-                "budget": "Budget"}
-# Entries that aren't a round of the team's work
-UNNUMBERED = {"budget": "## Budget", "dataset": "## The dataset"}
+                "model": "Choose the models", "results": "Conclusions", "budget": "Budget"}
+# Steps code takes after the lead's approval: no round of the team's work, and no reply
+CODE_STEPS = {"dataset": "## The dataset", "split": "## The split", "models": "## The trained models"}
+UNNUMBERED = {"budget": "## Budget", **CODE_STEPS}
+# Sections shown as code blocks, so tables and cost lines keep their columns
+TABLES = {"Costs", "Audit", "Lookups", "Recipe", "Steps", "Models", "Scores"}
 
 
 def entry(stage: str, round_number: int, sections: list[tuple[str, str]], feedback: str | None = None) -> dict:
@@ -37,10 +40,8 @@ def render(run_id: str, question: str, settings, history: list[dict]) -> str:
         lines += [UNNUMBERED.get(item["stage"], f"## Round {item['round']} · {title}"), ""]
         for heading, text in item["sections"]:
             lines += [f"### {heading}", ""]
-            # Tables and cost lines keep their columns in a code block
-            lines += ["```", text, "```", ""] if heading in ("Costs", "Audit", "Lookups", "Recipe", "Steps") else [text, ""]
-        # The dataset is made by code after the lead's approval, so there is no reply to show
-        if item["stage"] == "dataset":
+            lines += ["```", text, "```", ""] if heading in TABLES else [text, ""]
+        if item["stage"] in CODE_STEPS:
             continue
         reply = item["feedback"]
         if reply is None:

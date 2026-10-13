@@ -11,6 +11,7 @@ it logs every time it does, so the final scores come from molecules nothing was 
 import itertools
 import json
 import math
+import time
 import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -47,6 +48,8 @@ PICK_BY = {"classifier": ("roc_auc", True), "regressor": ("rmse", False)}
 FIXED = {"random_state": SEED}
 # The most combinations of settings one choice may try, so a run stays a sensible length
 MAX_SETTINGS = 12
+# How long one of the team's tries may take, in minutes
+TRY_MINUTES = 10
 
 
 def build(estimator: type, setting: dict):
@@ -89,6 +92,38 @@ class ChoiceError(ValueError):
     pass
 
 
+class TooSlow(ChoiceError):
+    pass
+
+
+def duration(seconds: float) -> str:
+    if seconds < 1:
+        return "under a second"
+    if seconds < 90:
+        return f"{seconds:.0f} seconds"
+    return f"{seconds / 60:.0f} minutes" if seconds < 5400 else f"{seconds / 3600:.1f} hours"
+
+
+class Clock:
+    """Times a try's fits. After each one it projects the total from the average so far, and stops
+    the try as soon as that would run past the limit, rather than finding out at the end."""
+
+    def __init__(self, fits: int, minutes: float | None = None):
+        self.fits, self.minutes, self.start, self.done = fits, minutes, time.monotonic(), 0
+
+    @property
+    def seconds(self) -> float:
+        return time.monotonic() - self.start
+
+    def tick(self) -> None:
+        self.done += 1
+        each = self.seconds / self.done
+        if self.minutes is not None and each * self.fits > 60 * self.minutes:
+            raise TooSlow(f"this would take about {duration(each * self.fits)} ({self.fits} fits at about "
+                          f"{duration(each)} each), over the {self.minutes:g}-minute limit for "
+                          f"one try; try fewer settings, settings that train faster, or a faster model")
+
+
 def check_features(features: str) -> None:
     if features not in FEATURES:
         raise ChoiceError(f"features must be one of {list(FEATURES)}")
@@ -97,6 +132,8 @@ def check_features(features: str) -> None:
 def make_choice(task: str, model: str, settings: dict | None = None) -> Choice:
     """A choice of model and settings to try, refusing anything off the menu. A setting given as
     a single value means "just this one"; settings not given keep the model's defaults."""
+    if task not in PICK_BY:
+        raise ChoiceError(f"task must be one of {list(PICK_BY)}")
     grid, available = {}, menu(task)
     if model not in available:
         raise ChoiceError(f"{task} must be one of the {len(available)} scikit-learn {task}s on the menu "
@@ -221,31 +258,42 @@ def settings(grid: dict) -> list[dict]:
     return [dict(zip(grid, values)) for values in itertools.product(*grid.values())]
 
 
-def cross_validate(train: pd.DataFrame, split: str, task: str, make, features: str, cutoff: float = ACTIVE_AT) -> dict:
+def cross_validate(train: pd.DataFrame, split: str, task: str, make, features: str, cutoff: float = ACTIVE_AT,
+                   clock: Clock | None = None) -> dict:
     """Mean and spread of each score over the fixed folds; each fold is scored by a model that
     never saw it."""
     X, y = matrix(tuple(train["smiles"]), features), labels(train, task, cutoff)
     folds = train[f"{split}_fold"].to_numpy(int)
-    per_fold = [scores(task, y[folds == k], predict(make().fit(X[folds != k], y[folds != k]), X[folds == k], task))
-                for k in range(FOLDS)]
+    per_fold = []
+    for k in range(FOLDS):
+        model = make().fit(X[folds != k], y[folds != k])
+        if clock:
+            clock.tick()
+        per_fold.append(scores(task, y[folds == k], predict(model, X[folds == k], task)))
     return {name: {"mean": float(np.mean(values)), "sd": float(np.std(values))}
             for name in per_fold[0] for values in [[fold[name] for fold in per_fold]]}
 
 
-def practice(train: pd.DataFrame, split: str, features: str, choice: Choice, cutoff: float = ACTIVE_AT) -> dict:
-    """Tries each combination of the choice's settings and keeps the best by practice score."""
+def practice(train: pd.DataFrame, split: str, features: str, choice: Choice, cutoff: float = ACTIVE_AT,
+             minutes: float | None = None) -> dict:
+    """Tries each combination of the choice's settings and keeps the best by practice score.
+    With a limit in minutes, stops as soon as it's clear the whole try would take longer."""
     estimator, (metric, higher) = menu(choice.task)[choice.model], PICK_BY[choice.task]
-    tried = []
-    for setting in settings(choice.settings):
+    combinations, tried = settings(choice.settings), []
+    clock = Clock(len(combinations) * FOLDS, minutes)
+    for setting in combinations:
         try:
             tried.append({"settings": setting, "scores": cross_validate(
-                train, split, choice.task, lambda: build(estimator, setting), features, cutoff)})
+                train, split, choice.task, lambda: build(estimator, setting), features, cutoff, clock)})
+        except TooSlow as error:
+            raise TooSlow(f"{choice.model}: {error}") from None
         except Exception as error:
             raise ChoiceError(f"{choice.model} with {setting} failed: {error}") from error
     # A score that can't be computed (NaN) counts as the worst
     best = max(tried, key=lambda t: np.nan_to_num((1 if higher else -1) * t["scores"][metric]["mean"], nan=-np.inf))
     return {"model": choice.model, "features": features, "settings": best["settings"], "scores": best["scores"],
-            "tried": len(tried)}
+            "tried": len(tried), "each": [{"settings": t["settings"], metric: t["scores"][metric]["mean"]} for t in tried],
+            "seconds": round(clock.seconds, 1)}
 
 
 def practice_baselines(train: pd.DataFrame, split: str, task: str, cutoff: float = ACTIVE_AT) -> dict:
@@ -375,6 +423,146 @@ def save(results: dict, predictions: pd.DataFrame, fitted: dict, source: Path, f
     return folder
 
 
+# --- Tools for the team: practice scores on the training part, and a proposal ---
+
+CHOICE_PROPERTIES = {
+    "model": {"type": "string", "description": "A scikit-learn model name from the menu"},
+    "settings": {"type": "object", "description": ('Settings to try, name -> a value or a list of values, e.g. '
+                                                   '{"C": [0.1, 1, 10]}. Settings left out keep the defaults')},
+}
+
+TRY_TOOL = {
+    "name": "try_models",
+    "description": (f"Practice scores for one model: {FOLDS}-fold cross-validation on the training part of the "
+                    f"{HEADLINE} split, trying each combination of settings and keeping the best, next to the "
+                    "baselines. The test part is never used."),
+    "input_schema": {"type": "object", "properties": {"features": {"type": "string", "enum": list(FEATURES)},
+                                                      "task": {"type": "string", "enum": list(PICK_BY)},
+                                                      **CHOICE_PROPERTIES},
+                     "required": ["features", "task", "model"]},
+}
+
+PROPOSE_TOOL = {
+    "name": "propose_models",
+    "description": ("Propose the features, the classifier and the regressor, each with the settings to try. Once the "
+                    "project lead approves, code picks the settings on practice scores, trains on the whole training "
+                    "part and scores the test part once. Calling it again replaces the earlier proposal."),
+    "input_schema": {"type": "object", "properties": {
+        "features": {"type": "string", "enum": list(FEATURES)},
+        **{task: {"type": "object", "properties": CHOICE_PROPERTIES, "required": ["model"]} for task in PICK_BY},
+        "reason": {"type": "string", "description": "Why these choices"}},
+        "required": ["features", *PICK_BY, "reason"]},
+}
+
+
+@lru_cache(maxsize=64)
+def cached_practice(folder: str, features: str, task: str, model: str, grid: str, minutes: float | None) -> dict:
+    # The same try made twice in a run (by the planner and the reviewer, say) is only computed once
+    train = training_part(load_split(Path(folder))[0], HEADLINE)
+    return practice(train, HEADLINE, features, Choice(task, model, json.loads(grid)), minutes=minutes)
+
+
+@lru_cache(maxsize=4)
+def cached_baselines(folder: str, task: str) -> dict:
+    return practice_baselines(training_part(load_split(Path(folder))[0], HEADLINE), HEADLINE, task)
+
+
+def practice_for(folder: Path, features: str, choice: Choice, minutes: float | None) -> tuple[dict, dict]:
+    check_features(features)
+    return (cached_practice(str(folder), features, choice.task, choice.model, json.dumps(choice.settings), minutes),
+            cached_baselines(str(folder), choice.task))
+
+
+def bootstrap_seconds(tested: int) -> float:
+    """How long the 95% intervals take, timed here: every split, target, model and baseline is
+    scored BOOTSTRAPS times on a test part of this size."""
+    rng, each = np.random.default_rng(SEED), {}
+    y = rng.normal(7, 1, tested)
+    for task, predicted in (("classifier", np.column_stack([rng.random(tested), rng.random(tested) > 0.5])),
+                            ("regressor", y + rng.normal(0, 1, tested))):
+        start = time.monotonic()
+        for _ in range(20):
+            scores(task, (y >= 7).astype(int) if task == "classifier" else y, predicted)
+        each[task] = (time.monotonic() - start) / 20
+    per_target = (1 + len(SENSITIVITY)) * each["classifier"] + each["regressor"]
+    return len(GROUPS) * (1 + len(BASELINES)) * BOOTSTRAPS * per_target
+
+
+def evaluate_seconds(classifier: dict, regressor: dict, tested: int) -> float:
+    """A rough time for `evaluate` from the practice timings: for each split, practice again, then
+    one final fit per target (three classifiers, one regressor), each about the time of one
+    practice fit; then the intervals."""
+    per_fit = {task: result["seconds"] / (result["tried"] * FOLDS) for task, result in
+               (("classifier", classifier), ("regressor", regressor))}
+    return (len(GROUPS) * (classifier["seconds"] + regressor["seconds"]
+                           + (1 + len(SENSITIVITY)) * per_fit["classifier"] + per_fit["regressor"])
+            + bootstrap_seconds(tested))
+
+
+def numbered(items: dict) -> dict:
+    # Ledger numbers for the auditor; a score that can't be computed has nothing to check
+    return {name: value for name, value in items.items() if value is not None and np.isfinite(value)}
+
+
+def try_models(folder: Path, request: dict, look_id: str, minutes: float | None = TRY_MINUTES) -> dict:
+    """Practice scores as a ledger entry, so the auditor can check numbers quoted from them."""
+    features = str(request.get("features"))
+    choice = make_choice(str(request.get("task")), str(request.get("model")), request.get("settings"))
+    result, baselines = practice_for(folder, features, choice, minutes)
+    metric = PICK_BY[choice.task][0]
+    rows = {choice.model: result["scores"], **baselines}
+    numbers = numbered({f"{name} | {score} {stat}": value for name, row in rows.items()
+                        for score, values in row.items() for stat, value in values.items()}
+                       | {f"setting {i} | {metric}": tried[metric] for i, tried in enumerate(result["each"], 1)})
+    each = "\n".join(f"  {i}. {tried['settings'] or 'defaults'}: {metric} {tried[metric]:.3f}"
+                     for i, tried in enumerate(result["each"], 1))
+    text = (f"{look_id} try_models {choice.task} {choice.model} on {features}, {HEADLINE} split, training part "
+            f"(mean ± sd over {FOLDS} folds), best settings {result['settings'] or 'defaults'}\n"
+            f"{practice_text({choice.model: result}, baselines)}\n"
+            f"Each of the {result['tried']} settings tried:\n{each}\n"
+            f"This try took {duration(result['seconds'])}.")
+    return {"id": look_id, "request": {"kind": "try_models", **request}, "text": text, "numbers": numbers}
+
+
+def propose(folder: Path, request: dict, minutes: float | None = TRY_MINUTES) -> dict:
+    """A proposal checked against the menu, with practice scores for the lead and how long training
+    and testing should take, computed by code."""
+    features, proposal, tables, timings = str(request.get("features")), {}, [], {}
+    for task in PICK_BY:
+        part = request.get(task) if isinstance(request.get(task), dict) else {"model": request.get(task)}
+        choice = make_choice(task, str(part.get("model")), part.get("settings"))
+        result, baselines = practice_for(folder, features, choice, minutes)
+        proposal[task], timings[task] = asdict(choice), result
+        tables.append(f"{task}, best of {result['tried']} settings: {result['settings'] or 'defaults'}\n"
+                      + practice_text({choice.model: result}, baselines))
+    heading = f"Practice scores ({HEADLINE} split, training part, mean ± sd over {FOLDS} folds):\n\n"
+    tested = int((load_split(folder)[0][f"{HEADLINE}_part"] == "test").sum())
+    seconds = evaluate_seconds(**timings, tested=tested)
+    estimate = (f"\n\nTraining and testing should take about {duration(seconds)} on this computer (a rough "
+                "estimate from the practice timings). It runs here and has no API cost.")
+    return {"features": features, **proposal, "reason": str(request.get("reason", "")),
+            "practice": heading + "\n\n".join(tables) + estimate}
+
+
+def choices(proposal: dict) -> tuple[Choice, Choice]:
+    return tuple(make_choice(task, proposal[task]["model"], proposal[task]["settings"]) for task in PICK_BY)
+
+
+def scores_entry(results: dict, look_id: str) -> dict:
+    """The test scores as a ledger entry, so the conclusions can be checked against them."""
+    numbers = {}
+    for split, targets_ in results.items():
+        for label, result in targets_.items():
+            rows = {result["model"]: result["test"], **result["baselines"]}
+            numbers |= {f"{split} | {label} | {name} | {metric}{'' if bound == 'value' else ' ' + bound}": value
+                        for name, row in rows.items() for metric, values in row.items()
+                        for bound, value in values.items()}
+            numbers |= {f"{split} | {label} | {result['model']} | practice {metric} {stat}": value
+                        for metric, values in (result["practice"] or {}).items() for stat, value in values.items()}
+    return {"id": look_id, "request": {"kind": "test_scores"}, "numbers": numbered(numbers),
+            "text": f"{look_id} test scores, each with its 95% interval\n{results_text(results)}"}
+
+
 def menu_text() -> str:
     return "\n\n".join(f"{task}s ({len(menu(task))}):\n  " + ", ".join(menu(task))
                          for task in ("classifier", "regressor"))
@@ -414,7 +602,7 @@ if __name__ == "__main__":
         for choice in (classifier, regressor):
             result = practice(train, HEADLINE, args.features, choice)
             print(f"{choice.task}, {HEADLINE} split, practice (mean ± sd over {FOLDS} folds), "
-                  f"best of {result['tried']} settings: {result['settings']}")
+                  f"best of {result['tried']} settings: {result['settings']}, took {duration(result['seconds'])}")
             print(practice_text({choice.model: result}, practice_baselines(train, HEADLINE, choice.task)) + "\n")
     else:
         uses = count_test_uses(args.split.resolve())
