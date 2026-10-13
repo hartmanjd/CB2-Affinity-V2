@@ -40,6 +40,11 @@ def choice(task):
     return train.make_choice(task, *LINEAR[task])
 
 
+def untimed(result: dict) -> str:
+    # Compared as JSON so that NaN (a score a tiny fold can't give) equals NaN; how long it took isn't a result
+    return json.dumps({key: value for key, value in result.items() if key != "seconds"})
+
+
 def test_the_menu_lists_scikit_learn_models_except_the_baselines():
     classifiers, regressors = train.menu("classifier"), train.menu("regressor")
     assert {"RandomForestClassifier", "LogisticRegression", "SVC", "KNeighborsClassifier", "MLPClassifier"} <= set(classifiers)
@@ -101,8 +106,7 @@ def test_menu_models_practise_and_repeat_exactly(table, task, model, settings):
     part = train.training_part(table, "scaffold")
     made = train.make_choice(task, model, settings)
     first = train.practice(part, "scaffold", "morgan2", made)
-    # Compared as JSON so that NaN (a score a tiny fold can't give) equals NaN
-    assert json.dumps(first) == json.dumps(train.practice(part, "scaffold", "morgan2", made))
+    assert untimed(first) == untimed(train.practice(part, "scaffold", "morgan2", made))
     assert first["tried"] == len(train.settings(made.settings))
     assert all(first["settings"][name] in values for name, values in made.settings.items())
     assert not np.isnan(first["scores"][train.PICK_BY[task][0]]["mean"])
@@ -114,12 +118,28 @@ def test_a_setting_the_model_rejects_is_reported(table):
         train.practice(train.training_part(table, "scaffold"), "scaffold", "morgan2", made)
 
 
+def test_a_try_that_would_run_past_its_limit_stops_early(table, monkeypatch):
+    made = train.make_choice("regressor", "Ridge", {"alpha": [0.1, 1.0, 10.0]})
+    # A clock where every fit seems to take a minute: 15 fits is about 15 minutes, over a 10-minute limit
+    ticks = iter(range(0, 3600, 60))
+    monkeypatch.setattr(train.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(train.TooSlow, match=r"Ridge: this would take about 15 minutes \(15 fits at about 60 seconds"):
+        train.practice(train.training_part(table, "scaffold"), "scaffold", "morgan2", made, minutes=10)
+    # It stopped after the first fit made the total clear, not at the end
+    assert next(ticks) == 120
+
+
+def test_durations_read_plainly():
+    assert [train.duration(s) for s in (0.2, 42, 600, 9000)] == ["under a second", "42 seconds", "10 minutes",
+                                                                 "2.5 hours"]
+
+
 def test_practice_never_sees_the_test_part(table):
     before = train.practice(train.training_part(table, "scaffold"), "scaffold", "morgan2", choice("regressor"))
     changed = table.copy()
     changed.loc[changed["scaffold_part"] == "test", "pchembl"] = 12.0
     after = train.practice(train.training_part(changed, "scaffold"), "scaffold", "morgan2", choice("regressor"))
-    assert json.dumps(before) == json.dumps(after)
+    assert untimed(before) == untimed(after)
 
 
 def test_evaluate_opens_each_test_part_once_and_scores_everything(table, saved):

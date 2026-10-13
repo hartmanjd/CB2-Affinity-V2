@@ -24,14 +24,29 @@ Enter to revise from the reviewer's critique.
    (see Cleaning below), trying them first with dry runs that show exactly how many records
    each step keeps and drops. The reviewer critiques the recipe (with dry runs of its own) and
    the auditor checks the numbers. At the pause you see the recipe's step-by-step counts,
-   computed by code. Once you approve, code makes the dataset; no agent touches it.
+   computed by code. Once you approve, code makes the dataset, then standardizes its molecules
+   and splits them (see Models below); no agent touches either.
+5. **Choose the models:** the planner chooses the features, a classifier and a regressor from
+   the menu, comparing them with **tries**: practice scores from cross-validation on the
+   training part, next to the baselines. The reviewer critiques the choice (with tries of its
+   own) and the auditor checks the numbers. Each try has a time limit (10 minutes by default,
+   `--max-try-minutes`): after every fit, code projects how long the whole try will take and
+   stops it early if that's over the limit. At the pause you see the practice scores of what
+   was chosen and a rough estimate of how long training and testing will take, both computed by
+   code. Once you approve, code trains the models, scores them once on the locked test part and
+   saves them.
+6. **Conclusions:** the planner writes what the test scores say about the question, how the
+   models compare with the baselines and the main limitations. The reviewer critiques it and
+   the auditor checks every number against the saved scores.
 
 Each stage is the same loop (budget check, worker, reviewer, auditor where there are numbers
 to check, then your approval), so in Studio the run reads plan → get_data → download →
-explore → clean → make_dataset, and each stage opens to show its loop.
+explore → clean → make_dataset → make_split → model → train_and_test → results, and each stage
+opens to show its loop.
 
 The agents decide what matters; the code only answers their questions and checks their
-numbers. Every search, count, look and dry run is numbered (L1, L2, ...) so numbers can be traced.
+numbers. Every search, count, look, dry run and try is numbered (L1, L2, ...), as are the split
+and the test scores, so numbers can be traced.
 
 Every pause is written to `runs/<run>/log.md`: each round's work, review, audit and costs,
 and what you answered. `runs/<run>/ledger.json` holds every lookup with its full result.
@@ -81,7 +96,8 @@ Run `pytest` (no API keys or internet needed). The cleaning tests use a small ma
 whose right answers were worked out by hand. Other tests break a download, the cleaning
 bookkeeping or the splits on purpose (a changed file, a repeated record, a lost dropped row, a
 value off the menu, ...) and check that the checks catch it, or change the test part's values
-and check that practice scores don't move.
+and check that practice scores don't move. Whole runs use stand-in models that call the same
+tools a real model would, from the plan to the trained models.
 
 ## Costs
 

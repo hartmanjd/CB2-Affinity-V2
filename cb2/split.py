@@ -154,6 +154,18 @@ def summary(table: pd.DataFrame, dropped: pd.DataFrame, compounds: int) -> str:
     return "\n".join(lines)
 
 
+def summary_entry(table: pd.DataFrame, dropped: pd.DataFrame, compounds: int, look_id: str) -> dict:
+    """The summary as a ledger entry, so the team can quote its numbers."""
+    numbers = {"compounds": compounds, "molecules": len(table), "dropped": len(dropped),
+               "scaffolds": table["scaffold"].nunique()}
+    for name in GROUPS:
+        for part in ("train", "test"):
+            rows = table[table[f"{name}_part"] == part]
+            numbers |= {f"{name} {part}": len(rows), f"{name} {part} active": int((rows["pchembl"] >= ACTIVE_AT).sum())}
+    return {"id": look_id, "request": {"kind": "split"}, "numbers": numbers,
+            "text": f"{look_id} {summary(table, dropped, compounds)}"}
+
+
 def save(table: pd.DataFrame, dropped: pd.DataFrame, source: Path, run_id: str = "") -> Path:
     folder = SPLIT / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder.mkdir(parents=True)
