@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
 PRACTICE_RUNS = ROOT / "practice-runs"
 
-STAGE_TITLES = {"plan": "Plan", "source": "Get the data", "data": "Explore the data", "budget": "Budget"}
+STAGE_TITLES = {"plan": "Plan", "source": "Get the data", "data": "Explore the data", "clean": "Clean the data",
+                "budget": "Budget"}
+# Entries that aren't a round of the team's work
+UNNUMBERED = {"budget": "## Budget", "dataset": "## The dataset"}
 
 
 def entry(stage: str, round_number: int, sections: list[tuple[str, str]], feedback: str | None = None) -> dict:
@@ -31,11 +34,14 @@ def render(run_id: str, question: str, settings, history: list[dict]) -> str:
         lines += ["**Team:** " + " · ".join(f"{key} = {value}" for key, value in asdict(settings).items()), ""]
     for item in history:
         title = STAGE_TITLES.get(item["stage"], item["stage"])
-        lines += [f"## Round {item['round']} · {title}" if item["stage"] != "budget" else "## Budget", ""]
+        lines += [UNNUMBERED.get(item["stage"], f"## Round {item['round']} · {title}"), ""]
         for heading, text in item["sections"]:
             lines += [f"### {heading}", ""]
             # Tables and cost lines keep their columns in a code block
-            lines += ["```", text, "```", ""] if heading in ("Costs", "Audit", "Lookups") else [text, ""]
+            lines += ["```", text, "```", ""] if heading in ("Costs", "Audit", "Lookups", "Recipe", "Steps") else [text, ""]
+        # The dataset is made by code after the lead's approval, so there is no reply to show
+        if item["stage"] == "dataset":
+            continue
         reply = item["feedback"]
         if reply is None:
             shown = "*(waiting for the lead)*"
