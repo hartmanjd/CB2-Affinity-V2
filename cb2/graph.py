@@ -5,13 +5,18 @@ Stage 2, get the data: the planner searches ChEMBL and proposes which targets to
 the reviewer critiques the choice (with searches of its own) and the auditor checks its numbers.
 Stage 3, explore the data: the planner explores the download with looks and writes findings;
 the reviewer checks them (with looks of its own) and the auditor checks every number.
-Every stage is the same loop, built once by make_stage and used three times as a subgraph:
+Stage 4, clean the data: the planner chooses a cleaning recipe from a fixed menu, trying settings
+with dry runs; the reviewer critiques it (with dry runs of its own) and the auditor checks every
+number. Once the lead approves, code makes the dataset.
+Every stage is the same loop, built once by make_stage and used four times as a subgraph:
 budget check → worker → reviewer → (auditor) → the lead's approval → back round, or on to the
 next stage. Every pause is written to the run log in runs/."""
 
 import argparse
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
 import requests
@@ -20,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
-from cb2 import chembl, data, runlog
+from cb2 import chembl, clean, data, runlog
 from cb2.audit import audit
 from cb2.costs import round_cost, spent, summary
 from cb2.llm import EFFORTS, MODELS, ask, ask_with_tools, check_model
@@ -181,6 +186,81 @@ You can make up to {max_lookups} looks of your own to check claims or follow up 
 the planner missed. Then list the three most important problems with the findings or the
 proposed steps, one or two sentences each. Cite looks in brackets, like [L3], for any numbers."""
 
+CLEAN_PROMPT = """You are the planner of a small study using data from ChEMBL, analysed in Python.
+
+Research question: {question}
+
+The approved research plan:
+{plan}
+
+The downloaded table holds every activity record for these ChEMBL targets: {targets}
+{overview}
+
+Your approved findings from exploring it:
+{findings}
+
+Next, choose how to clean the table into the dataset the plan needs: one row per compound, with
+one affinity value. Code runs these steps in this order; the settings in brackets are yours to
+choose, and the rest is fixed:
+{steps}
+
+Use try_recipe to see exactly how many records each step keeps and drops with given settings, and
+look to check anything else; you can make up to {max_lookups} tries and looks. When you have
+decided, call propose_recipe with the settings and your reasons. Then write a short summary for
+the project lead: the settings you chose, what they cost in records and compounds, and why.
+
+Whenever you state a number from a try or look, cite it in brackets, like [L3].
+Keep the summary under 300 words."""
+
+CLEAN_REVISION_PROMPT = CLEAN_PROMPT + """
+
+Your previous recipe:
+{recipe}
+
+Your previous summary:
+{summary}
+
+Tries and looks made so far (you can repeat or extend them):
+{lookup_list}
+
+A reviewer's critique of the recipe:
+{review}
+
+The auditor's check of the numbers in it:
+{audit}
+
+Feedback from the project lead:
+{feedback}
+
+Make an improved recipe (call propose_recipe again) that addresses the lead's feedback and the
+points of the critique you judge most important, and write a new summary. If a point in the
+critique is wrong, don't follow it; say so in a short note at the end."""
+
+CLEAN_REVIEWER_PROMPT = """You are a critical reviewer of studies that use ChEMBL data.
+
+Question: {question}
+
+Plan:
+{plan}
+
+The planner proposes cleaning the downloaded data with a recipe. Code runs these steps in this
+order; the settings in brackets were the planner's to choose, and the rest is fixed:
+{steps}
+
+The proposed recipe, and what code found it does to the data:
+{recipe}
+
+The planner's summary:
+{summary}
+
+The planner's tries and looks, with their results:
+{lookups}
+
+The plan and the findings have already been approved, so don't review them again. Review the
+recipe: whether each setting suits the question and the plan, and what it costs in data. You can
+make up to {max_lookups} tries and looks of your own. Then list the three most important problems
+with the recipe, one or two sentences each. Cite results in brackets, like [L3], for any numbers."""
+
 # Dollars a run may spend before it pauses to ask for more; pass "budget" in the input to change it
 DEFAULT_BUDGET = 2.00
 REVIEWER_LOOKUPS = 5
@@ -233,7 +313,7 @@ def grow(existing: list, new: list) -> list:
 class State(TypedDict, total=False):
     question: str
     run_id: str
-    stage: Literal["plan", "source", "data"]
+    stage: Literal["plan", "source", "data", "clean"]
     # Counts rounds across all stages; every cost record says which round it belongs to
     round: int
     budget: float
@@ -260,6 +340,12 @@ class State(TypedDict, total=False):
     findings: str
     data_review: str
     data_feedback: str
+    # Stage 4: clean the data
+    recipe: dict
+    recipe_summary: str
+    clean_review: str
+    clean_feedback: str
+    clean_folder: str
 
 
 
@@ -376,6 +462,8 @@ def lookup_runner(state: State, ledger: list[dict], by: str):
                                                 request.get("standard_types"), look_id)
             elif name == "look":
                 entry = look(data.load(state["data_folder"]), request, look_id)
+            elif name == "try_recipe":
+                entry = clean.try_recipe(data.load(state["data_folder"]), request, look_id)
             else:
                 return f"Unknown tool {name!r}."
         except (ValueError, LookError) as error:
@@ -385,6 +473,9 @@ def lookup_runner(state: State, ledger: list[dict], by: str):
         ledger.append({**entry, "by": by, "round": state["round"]})
         return entry["text"]
     return run
+
+
+LOOK_KINDS = {"value_counts", "crosstab", "describe", "sample"}
 
 
 def lookup_list(ledger: list[dict], stage_kinds: set[str]) -> str:
@@ -491,20 +582,24 @@ def download(state: State, runtime: Runtime[Settings]) -> dict:
 
 # --- Stage 3: explore the data ---
 
+def about_the_data(state: State) -> dict:
+    # The approved targets and the table overview: what the agents know before their first look
+    targets = ", ".join(f"{t['target_chembl_id']} ({t['pref_name']}, {t['organism'] or '-'}, {t['target_type']})"
+                        for t in state["proposal"]["targets"])
+    table_overview = next(entry["text"] for entry in state["ledger"] if entry["id"] == state["overview_id"])
+    return {"question": state["question"], "plan": state["plan"], "targets": targets, "overview": table_overview}
+
+
 def explorer(state: State, runtime: Runtime[Settings]) -> dict:
     settings = runtime.context or Settings()
     state = {**state, "round": state["round"] + 1}
     ledger = list(state["ledger"])
-    table_overview = next(entry["text"] for entry in ledger if entry["id"] == state["overview_id"])
-    targets = ", ".join(f"{t['target_chembl_id']} ({t['pref_name']}, {t['organism'] or '-'}, {t['target_type']})"
-                        for t in state["proposal"]["targets"])
-    fields = dict(question=state["question"], plan=state["plan"], targets=targets,
-                  overview=table_overview, max_lookups=settings.max_lookups)
+    fields = dict(**about_the_data(state), max_lookups=settings.max_lookups)
     if "findings" not in state:
         prompt = EXPLORE_PROMPT.format(**fields)
     else:
         prompt = EXPLORE_REVISION_PROMPT.format(
-            **fields, findings=state["findings"], look_list=lookup_list(ledger, {"value_counts", "crosstab", "describe", "sample"}),
+            **fields, findings=state["findings"], look_list=lookup_list(ledger, LOOK_KINDS),
             review=state["data_review"], audit=state["audit_report"], feedback=state["data_feedback"] or NO_FEEDBACK,
         )
     findings, usage = ask_with_tools(prompt, settings.planner_model, effort(settings.planner_effort),
@@ -525,6 +620,81 @@ def data_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
             "costs": [cost_record("reviewer", state, usage)]}
 
 
+# --- Stage 4: clean the data ---
+
+def format_recipe(recipe: dict | None) -> str:
+    if not recipe:
+        return "(no recipe proposed)"
+    settings = " · ".join(f"{key}={json.dumps(value)}" for key, value in recipe["settings"].items())
+    return f"{settings}\nReason: {recipe['reason']}\n\n{recipe['steps']}"
+
+
+def cleaner(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    state = {**state, "round": state["round"] + 1}
+    ledger = list(state["ledger"])
+    run_lookup = lookup_runner(state, ledger, "cleaner")
+    proposal = {}
+
+    def run(name: str, request: dict) -> str:
+        if name != "propose_recipe":
+            return run_lookup(name, request)
+        table = data.load(state["data_folder"])
+        try:
+            recipe = clean.make_recipe({key: request[key] for key in clean.RECIPE_PROPERTIES if key in request}, table)
+        except clean.RecipeError as error:
+            return f"Not proposed: {error}"
+        # The lead sees what the recipe does, computed by code, next to the planner's summary
+        steps = clean.waterfall_text(clean.run(table, recipe).waterfall)
+        proposal.update(settings=json.loads(json.dumps(asdict(recipe))), reason=str(request.get("reason", "")),
+                        steps=steps)
+        return "Recipe recorded:\n" + format_recipe(proposal) + "\nNow write your summary for the lead."
+
+    fields = dict(**about_the_data(state), findings=state["findings"], steps=clean.STEPS_TEXT,
+                  max_lookups=settings.max_lookups)
+    if "recipe_summary" not in state:
+        prompt = CLEAN_PROMPT.format(**fields)
+    else:
+        prompt = CLEAN_REVISION_PROMPT.format(
+            **fields, recipe=format_recipe(state.get("recipe")), summary=state["recipe_summary"],
+            lookup_list=lookup_list(ledger, LOOK_KINDS | {"try_recipe"}), review=state["clean_review"],
+            audit=state["audit_report"], feedback=state["clean_feedback"] or NO_FEEDBACK,
+        )
+    summary_text, usage = ask_with_tools(prompt, settings.planner_model, effort(settings.planner_effort),
+                                         [LOOK_TOOL, clean.TRY_TOOL, clean.PROPOSE_TOOL], run,
+                                         settings.max_lookups, uncounted=("propose_recipe",))
+    return {"recipe_summary": summary_text, "recipe": proposal or state.get("recipe") or {},
+            "round": state["round"], "ledger": ledger[len(state["ledger"]):],
+            "costs": [cost_record("cleaner", state, usage)]}
+
+
+def clean_reviewer(state: State, runtime: Runtime[Settings]) -> dict:
+    settings = runtime.context or Settings()
+    ledger = list(state["ledger"])
+    this_round = [entry["text"] for entry in ledger if entry.get("by") == "cleaner" and entry["round"] == state["round"]]
+    prompt = CLEAN_REVIEWER_PROMPT.format(question=state["question"], plan=state["plan"], steps=clean.STEPS_TEXT,
+                                          recipe=format_recipe(state["recipe"]), summary=state["recipe_summary"],
+                                          lookups="\n\n".join(this_round) or "(none)", max_lookups=REVIEWER_LOOKUPS)
+    review, usage = ask_with_tools(prompt, settings.reviewer_model, effort(settings.reviewer_effort),
+                                   [LOOK_TOOL, clean.TRY_TOOL], lookup_runner(state, ledger, "reviewer"),
+                                   REVIEWER_LOOKUPS)
+    return {"clean_review": review, "ledger": ledger[len(state["ledger"]):],
+            "costs": [cost_record("reviewer", state, usage)]}
+
+
+def make_dataset(state: State, runtime: Runtime[Settings]) -> dict:
+    """Code, not an agent: make the dataset from the approved recipe, check it and save it."""
+    table = data.load(state["data_folder"])
+    recipe = clean.make_recipe(state["recipe"]["settings"], table)
+    result = clean.run(table, recipe)
+    folder = clean.save(result, Path(state["data_folder"]), recipe, state["recipe"]["reason"], state["run_id"])
+    text = f"Saved {len(result.clean):,} compounds to {clean.shown(folder)}\n\n{clean.waterfall_text(result.waterfall)}"
+    item = runlog.entry("dataset", state["round"], [("Steps", text)])
+    runlog.write(state["run_id"], state["question"], runtime.context or Settings(),
+                 state.get("history", []) + [item], state.get("ledger", []))
+    return {"clean_folder": str(folder), "history": [item]}
+
+
 def make_builder() -> StateGraph:
     plan = make_stage(
         "plan", planner, plan_reviewer, "plan_feedback",
@@ -542,19 +712,30 @@ def make_builder() -> StateGraph:
         show=lambda state: {"Findings": state["findings"], "Review": state["data_review"],
                             "Audit": state["audit_report"]},
         audit_sections=lambda state: {"Findings": state["findings"], "Review": state["data_review"]})
+    clean_data = make_stage(
+        "clean", cleaner, clean_reviewer, "clean_feedback",
+        show=lambda state: {"Recipe": format_recipe(state["recipe"]), "Summary": state["recipe_summary"],
+                            "Review": state["clean_review"], "Audit": state["audit_report"]},
+        audit_sections=lambda state: {"Summary": f"{state['recipe'].get('reason', '')}\n{state['recipe_summary']}",
+                                      "Review": state["clean_review"]},
+        not_ready=lambda state: None if state["recipe"] else "You haven't proposed a recipe yet. Call propose_recipe.")
 
     builder = StateGraph(State, context_schema=Settings)
     builder.add_node("plan", plan)
     builder.add_node("get_data", get_data)
     builder.add_node("download", download)
     builder.add_node("explore", explore)
+    builder.add_node("clean", clean_data)
+    builder.add_node("make_dataset", make_dataset)
     # Each stage ends either approved (go on) or stopped at the budget (end the run)
     builder.add_edge(START, "plan")
     builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else "get_data", ["get_data", END])
     builder.add_conditional_edges("get_data", lambda state: END if state.get("stopped") else "download", ["download", END])
     builder.add_edge("download", "explore")
-    # (explore is the last stage, so approved or stopped, the run ends there)
-    builder.add_edge("explore", END)
+    builder.add_conditional_edges("explore", lambda state: END if state.get("stopped") else "clean", ["clean", END])
+    builder.add_conditional_edges("clean", lambda state: END if state.get("stopped") else "make_dataset",
+                                  ["make_dataset", END])
+    builder.add_edge("make_dataset", END)
     return builder
 
 
@@ -596,3 +777,5 @@ if __name__ == "__main__":
     log_folder = "practice-runs" if settings.practice else "runs"
     print(f"\nFinished ({status}, ${spent(result.get('costs', [])):.3f} spent). "
           f"Log: {log_folder}/{result['run_id']}/log.md")
+    if result.get("clean_folder"):
+        print(f"Dataset: {result['clean_folder']}")

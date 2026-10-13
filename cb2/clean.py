@@ -37,6 +37,44 @@ class RecipeError(ValueError):
     pass
 
 
+# What the agents are told about the steps; the settings they choose are the ones in brackets
+STEPS_TEXT = """1. keep the chosen targets [targets: any of the downloaded targets]
+2. keep the chosen measurement types [types: any of Ki, Kd, IC50]
+3. keep binding assays, at or above a minimum ChEMBL assay confidence score [min_confidence: null, 8 or 9]
+4. drop records ChEMBL flags with a data validity warning or as potential duplicates [drop_flagged: true or false]
+5. keep exact values only (fixed: censored values such as "> 10,000 nM" are dropped)
+6. keep usable values (fixed: a value in nM above zero, a structure and a parent compound), and
+   convert each to pChEMBL, -log10 of the value in molar (fixed; for Ki records this is pKi)
+7. combine repeat measurements of each parent compound [combine: median or mean], dropping compounds
+   whose measurements are further apart than a limit in log units [max_spread: null, 0.5, 1.0 or 1.5]"""
+
+RECIPE_PROPERTIES = {
+    "targets": {"type": "array", "items": {"type": "string"}, "description": "Target IDs to keep"},
+    "types": {"type": "array", "items": {"type": "string", "enum": list(TYPES)}},
+    "min_confidence": {"type": ["integer", "null"], "enum": list(MENU["min_confidence"])},
+    "drop_flagged": {"type": "boolean"},
+    "combine": {"type": "string", "enum": list(MENU["combine"])},
+    "max_spread": {"type": ["number", "null"], "enum": list(MENU["max_spread"])},
+}
+
+TRY_TOOL = {
+    "name": "try_recipe",
+    "description": ("Run the cleaning steps with these settings without saving anything, and see how many "
+                    "records each step keeps and drops, how many compounds are left and their values."),
+    "input_schema": {"type": "object", "properties": RECIPE_PROPERTIES, "required": list(RECIPE_PROPERTIES)},
+}
+
+PROPOSE_TOOL = {
+    "name": "propose_recipe",
+    "description": ("Propose the cleaning settings. The project lead approves the recipe before the dataset is "
+                    "made. Calling it again replaces the earlier proposal."),
+    "input_schema": {"type": "object",
+                     "properties": {**RECIPE_PROPERTIES,
+                                    "reason": {"type": "string", "description": "Why these settings"}},
+                     "required": [*RECIPE_PROPERTIES, "reason"]},
+}
+
+
 @dataclass(frozen=True)
 class Recipe:
     targets: tuple[str, ...]
@@ -204,6 +242,33 @@ def waterfall_text(waterfall: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def describe(recipe: Recipe) -> str:
+    return " · ".join(f"{key}={json.dumps(value)}" for key, value in asdict(recipe).items())
+
+
+def try_recipe(table: pd.DataFrame, request: dict, look_id: str) -> dict:
+    """A dry run as a ledger entry, so the auditor can check numbers quoted from it."""
+    recipe = make_recipe(request, table)
+    result = run(table, recipe)
+    values = result.clean["pchembl"]
+    overall = {"compounds": len(result.clean),
+               "compounds measured more than once": int((result.clean["n_measurements"] > 1).sum())}
+    if len(values):
+        overall |= {"pchembl min": float(values.min()), "pchembl median": float(values.median()),
+                    "pchembl max": float(values.max())}
+    numbers = {f"{step['step']} | {column.replace('_', ' ')}": step[column]
+               for step in result.waterfall for column in ("rows_in", "dropped", "rows_out")} | overall
+    summary = " · ".join(f"{name}: {value:,}" if isinstance(value, int) else f"{name}: {value:g}"
+                         for name, value in overall.items())
+    text = f"{look_id} try_recipe {describe(recipe)}\n{waterfall_text(result.waterfall)}\n{summary}"
+    return {"id": look_id, "request": {"kind": "try_recipe", **request}, "text": text, "numbers": numbers}
+
+
+def shown(path: Path) -> str:
+    # Paths inside the project are recorded relative to it, so records don't depend on where it lives
+    return str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path)
+
+
 def code_version() -> str:
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True)
@@ -213,7 +278,7 @@ def code_version() -> str:
     return commit.stdout.strip() + (" (with uncommitted changes)" if changed.stdout.strip() else "")
 
 
-def save(result: Result, source: Path, recipe: Recipe, run_id: str = "") -> Path:
+def save(result: Result, source: Path, recipe: Recipe, reason: str = "", run_id: str = "") -> Path:
     folder = CLEAN / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder.mkdir(parents=True)
     result.clean.to_csv(folder / "clean.csv", index=False)
@@ -221,9 +286,10 @@ def save(result: Result, source: Path, recipe: Recipe, run_id: str = "") -> Path
     manifest = {
         "made_at_utc": folder.name,
         "run": run_id,
-        "source": {"folder": str(source.relative_to(ROOT) if source.is_relative_to(ROOT) else source),
+        "source": {"folder": shown(source),
                    "manifest_sha256": sha256(source / "manifest.json")},
         "recipe": asdict(recipe),
+        "reason": reason,
         "code_version": code_version(),
         "waterfall": result.waterfall,
         "rows": {"compounds": len(result.clean), "dropped": len(result.dropped)},

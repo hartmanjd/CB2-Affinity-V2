@@ -20,13 +20,18 @@ Enter to revise from the reviewer's critique.
    explores with **looks**: questions such as "how many rows have each value of this
    column" that code answers exactly. It writes findings, citing a look for every number;
    the reviewer critiques them (with looks of its own) and the auditor checks the numbers.
+4. **Clean the data:** the planner chooses a cleaning **recipe**: settings from a fixed menu
+   (see Cleaning below), trying them first with dry runs that show exactly how many records
+   each step keeps and drops. The reviewer critiques the recipe (with dry runs of its own) and
+   the auditor checks the numbers. At the pause you see the recipe's step-by-step counts,
+   computed by code. Once you approve, code makes the dataset; no agent touches it.
 
 Each stage is the same loop (budget check, worker, reviewer, auditor where there are numbers
 to check, then your approval), so in Studio the run reads plan → get_data → download →
-explore, and each stage opens to show its loop.
+explore → clean → make_dataset, and each stage opens to show its loop.
 
 The agents decide what matters; the code only answers their questions and checks their
-numbers. Every search, count and look is numbered (L1, L2, ...) so numbers can be traced.
+numbers. Every search, count, look and dry run is numbered (L1, L2, ...) so numbers can be traced.
 
 Every pause is written to `runs/<run>/log.md`: each round's work, review, audit and costs,
 and what you answered. `runs/<run>/ledger.json` holds every lookup with its full result.
