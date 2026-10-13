@@ -61,13 +61,17 @@ gpt-6-luna reviewing, a local auditor) keeps practice to fractions of a cent per
 `cb2/train.py` trains two separate models on a saved split: a **classifier** (active means
 pKi ≥ 7) and a **regressor** (the pKi itself). What is chosen and what is fixed:
 
-- **Chosen:** the features, and for each model any scikit-learn classifier or regressor on the
-  menu (`python -m cb2.train --menu` lists them), with the settings to try, e.g.
-  `{"C": [0.1, 1, 10]}`. The menu is built from scikit-learn itself: every model that can be
-  built with its defaults and passes a quick fit-and-predict check. Settings are checked against
-  the model's own list, and one choice may try at most 12 combinations.
+- **Chosen:** the features, and for each model any classifier or regressor on the menu
+  (`python -m cb2.train --menu` lists them), with the settings to try, e.g.
+  `{"C": [0.1, 1, 10]}`. The menu is built from scikit-learn itself, plus XGBoost's gradient
+  boosting (`XGBClassifier`, `XGBRegressor`) and scikit-learn's SVMs comparing molecules by the
+  Tanimoto similarity of their fingerprints (`TanimotoSVC`, `TanimotoSVR`, for morgan2 or morgan3
+  features): every model that can be built with its defaults and passes a quick fit-and-predict
+  check. Settings are checked against the model's own list, and one choice may try at most 12
+  combinations.
 - **Fixed:** the seed (`random_state`, wherever a model has one), how features are prepared
-  (missing values filled with the training median, then scaled), 5-fold cross-validation inside
+  (missing values filled with the training median, then scaled, except for the Tanimoto SVMs,
+  which compare the fingerprints themselves), 5-fold cross-validation inside
   the training part to pick the best settings (by ROC AUC for the classifier, RMSE for the
   regressor), the metrics (classifier: ROC AUC, average precision, balanced accuracy, MCC;
   regressor: RMSE, MAE, R², Spearman) and the cutoff.

@@ -283,8 +283,9 @@ Next, choose how to model it. Code trains two separate models: a classifier (act
 pKi >= {active_at:g}) and a regressor that predicts pKi. You choose:
 - the features, one of:
 {features}
-- the classifier and the regressor: any scikit-learn model on this menu, with settings to try
-  (at most {max_settings} combinations each; settings you leave out keep the model's defaults):
+- the classifier and the regressor: any model on this menu, with settings to try (at most
+  {max_settings} combinations each; settings you leave out keep the model's defaults). TanimotoSVC
+  and TanimotoSVR compare molecules by Tanimoto similarity, so they need morgan2 or morgan3:
 {menu}
 
 Fixed by code: the splits and folds, the seed, how the features are prepared (missing values
