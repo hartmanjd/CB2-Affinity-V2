@@ -29,23 +29,27 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def verify_download(folder: Path) -> pd.DataFrame:
-    """Check a raw download against its manifest and return its table."""
-    what = f"The download in {folder}"
+def verify_files(folder: Path, what: str) -> dict:
+    """Check a saved folder's files against its manifest and return the manifest. If any file
+    changed, nothing read from it can be trusted."""
     if not (folder / "manifest.json").exists():
-        raise CheckFailed(what, ["it has no manifest.json, so the download never finished"])
+        raise CheckFailed(what, ["it has no manifest.json, so it was never finished"])
     manifest = json.loads((folder / "manifest.json").read_text())
-
-    # Files first: if any file changed, nothing read from it can be trusted
     listed = manifest["sha256"]
     present = {path.name for path in folder.iterdir() if path.name != "manifest.json"}
     problems = [f"{name} is missing" for name in sorted(listed.keys() - present)]
     problems += [f"{name} is not in the manifest" for name in sorted(present - listed.keys())]
-    problems += [f"{name} has changed since it was downloaded (its checksum differs)"
+    problems += [f"{name} has changed since it was saved (its checksum differs)"
                  for name in sorted(listed.keys() & present) if sha256(folder / name) != listed[name]]
     if problems:
         raise CheckFailed(what, problems)
+    return manifest
 
+
+def verify_download(folder: Path) -> pd.DataFrame:
+    """Check a raw download against its manifest and return its table."""
+    what = f"The download in {folder}"
+    manifest = verify_files(folder, what)
     table = pd.read_csv(folder / "table.csv.gz", low_memory=False)
     activities = json.loads((folder / "activities.json").read_text())
     counts = {"activities": len(activities), "assays": len(json.loads((folder / "assays.json").read_text())),

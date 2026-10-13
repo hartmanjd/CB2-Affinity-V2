@@ -111,11 +111,36 @@ counts and checksums. Before saving, the code checks that every record is either
 exactly once, that every step's counts add up, and that every value is between 2 and 12 and
 agrees with ChEMBL's own `pchembl_value`.
 
+## Molecules and splits
+
+Before modeling, `cb2/split.py` prepares a clean dataset and splits it. None of this is chosen
+by the team:
+
+- **Standardizing:** each structure keeps its largest piece (dropping salts and solvents) and
+  is neutralized. Compounds that turn out to be the same molecule are merged (median value), or
+  dropped if their values are further apart than the recipe's `max_spread`; unreadable
+  structures are dropped. Every compound is either in one molecule or dropped, exactly once.
+- **Scaffold split (the headline):** molecules are grouped by their ring system (Bemis–Murcko
+  scaffold), and whole groups go to training or test, so the test asks about new kinds of
+  molecule. About 20% go to test.
+- **Random split (for comparison):** the same, with every molecule its own group.
+- **Folds:** each split's training part is divided into 5 cross-validation folds, again
+  keeping groups together. A fixed seed makes all of it repeat exactly.
+
+`python -m cb2.split data/clean/<folder>` (or `--dry-run`) saves `data/split/<timestamp>/`
+with `molecules.csv` (each molecule's structure, value, scaffold, part and fold in both
+splits), `dropped.csv` and a manifest of the source, settings, RDKit and code versions, counts
+and checksums. It checks the clean dataset's checksums before reading it, and checks the splits
+(no group in both parts or in two folds, no test molecule in a fold) before saving.
+
+`cb2/features.py` turns structures into numbers, from a menu: Morgan fingerprint counts
+(radius 2 or 3, 2048 bits), RDKit descriptors, or both.
+
 ## Tests
 
 Run `pytest` (no API keys or internet needed). The cleaning tests use a small made-up table
-whose right answers were worked out by hand. Other tests break a download or the cleaning
-bookkeeping on purpose (a changed file, a repeated record, a lost dropped row, a value off the
+whose right answers were worked out by hand. Other tests break a download, the cleaning
+bookkeeping or the splits on purpose (a changed file, a repeated record, a lost dropped row, a value off the
 menu, ...) and check that the checks catch it.
 
 ## Costs
