@@ -1,9 +1,9 @@
 """Train and score two separate models: a classifier (is a molecule active, pKi >= 7?) and a
 regressor (what is its pKi?).
 
-A researcher (or the team) chooses the features, any scikit-learn model on the menu and the
-settings to try. Everything that decides how honest
-the scores are is fixed here: the splits and folds (made by cb2.split), the seed, how features
+A researcher (or the team) chooses the features, any model on the menu (scikit-learn's, XGBoost's,
+or an SVM comparing molecules by Tanimoto similarity) and the settings to try. Everything that
+decides how honest the scores are is fixed here: the splits and folds (made by cb2.split), the seed, how features
 are prepared, the metrics, the baselines and the test part. Choices are compared on practice
 scores from cross-validation inside the training part. Only `evaluate` reads the test part, and
 it logs every time it does, so the final scores come from molecules nothing was tuned on."""
@@ -23,13 +23,16 @@ import numpy as np
 import pandas as pd
 import rdkit
 import sklearn
+import xgboost
 from scipy.stats import rankdata, spearmanr
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import average_precision_score, mean_absolute_error, r2_score, root_mean_squared_error
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC, SVR
 from sklearn.utils import all_estimators
+from xgboost import XGBClassifier, XGBRegressor
 
 from cb2.checks import CheckFailed, sha256, verify_files
 from cb2.clean import ROOT, code_version, shown
@@ -52,25 +55,76 @@ MAX_SETTINGS = 12
 TRY_MINUTES = 10
 
 
+def fingerprints(X) -> np.ndarray:
+    X = np.asarray(X)
+    if (X < 0).any() or (X != np.round(X)).any():
+        raise ValueError("Tanimoto similarity compares fingerprints, so it needs morgan2 or morgan3 features")
+    return (X > 0).astype(float)
+
+
+def tanimoto(X, Y) -> np.ndarray:
+    """How alike each molecule in X is to each in Y: of the fingerprint bits set in either, the
+    share set in both (0 to 1)."""
+    X, Y = (X > 0).astype(float), (Y > 0).astype(float)
+    shared = X @ Y.T
+    return shared / np.maximum(X.sum(1)[:, None] + Y.sum(1)[None, :] - shared, 1)
+
+
+def tanimoto_kernel(X, Y) -> np.ndarray:
+    return tanimoto(fingerprints(X), fingerprints(Y))
+
+
+class TanimotoSVC(SVC):
+    """scikit-learn's SVM classifier, comparing molecules by the Tanimoto similarity of their
+    fingerprints instead of a general-purpose distance."""
+    # Tanimoto similarity needs the fingerprints as they are, not scaled
+    scaled = False
+
+    def __init__(self, C=1.0, shrinking=True, tol=1e-3, cache_size=200, class_weight=None, max_iter=-1,
+                 random_state=None):
+        super().__init__(kernel=tanimoto_kernel, C=C, shrinking=shrinking, tol=tol, cache_size=cache_size,
+                         class_weight=class_weight, max_iter=max_iter, random_state=random_state)
+
+
+class TanimotoSVR(SVR):
+    """scikit-learn's SVM regressor, comparing molecules by Tanimoto similarity."""
+    scaled = False
+
+    def __init__(self, C=1.0, epsilon=0.1, shrinking=True, tol=1e-3, cache_size=200, max_iter=-1):
+        super().__init__(kernel=tanimoto_kernel, C=C, epsilon=epsilon, shrinking=shrinking, tol=tol,
+                         cache_size=cache_size, max_iter=max_iter)
+
+
+# Offered next to scikit-learn's own models: the Tanimoto SVMs above, and XGBoost, which works the same way
+EXTRAS = {"classifier": [("TanimotoSVC", TanimotoSVC), ("XGBClassifier", XGBClassifier)],
+          "regressor": [("TanimotoSVR", TanimotoSVR), ("XGBRegressor", XGBRegressor)]}
+
+
 def build(estimator: type, setting: dict):
     """Every model sees the features the same way: missing values filled with the training
-    median, then each feature put on the same scale. The seed is set wherever a model takes one."""
+    median, then each feature put on the same scale (except for models that compare the
+    fingerprints themselves). The seed is set wherever a model takes one."""
     fixed = {key: value for key, value in FIXED.items() if key in estimator().get_params()}
-    return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), StandardScaler(),
+    scaler = [StandardScaler()] if getattr(estimator, "scaled", True) else []
+    return make_pipeline(SimpleImputer(strategy="median", keep_empty_features=True), *scaler,
                          estimator(**fixed, **setting))
 
 
 @lru_cache(maxsize=2)
 def menu(task: str) -> dict[str, type]:
-    """Every scikit-learn model of this kind that can be built with its defaults and passes a
-    quick fit-and-predict check through `build`. Dummy models are the baselines, so they're left out."""
+    """Every scikit-learn model of this kind, and the extras, that can be built with its defaults
+    and passes a quick fit-and-predict check through `build`. Dummy models are the baselines, so
+    they're left out. Models that compare fingerprints are checked on made-up fingerprint counts."""
     rng = np.random.default_rng(SEED)
-    X = rng.normal(size=(40, 6))
-    y = (X[:, 0] > 0).astype(int) if task == "classifier" else X[:, 0] + 0.1 * rng.normal(size=40)
+    data = {}
+    for kind, X in (("values", rng.normal(size=(40, 6))), ("counts", rng.poisson(1.0, size=(40, 6)).astype(float))):
+        y = (X[:, 0] > np.median(X[:, 0])).astype(int) if task == "classifier" else X[:, 0] + 0.1 * rng.normal(size=40)
+        data[kind] = X, y
     found = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        for name, estimator in all_estimators(type_filter=task):
+        for name, estimator in all_estimators(type_filter=task) + EXTRAS[task]:
+            X, y = data["values" if getattr(estimator, "scaled", True) else "counts"]
             try:
                 if not name.startswith("Dummy") and np.isfinite(
                         predict(build(estimator, {}).fit(X[:30], y[:30]), X[30:], task)).all():
@@ -82,7 +136,7 @@ def menu(task: str) -> dict[str, type]:
 
 @dataclass(frozen=True)
 class Choice:
-    """One model choice: a scikit-learn model and the settings to try (name -> list of values)."""
+    """One model choice: a model on the menu and the settings to try (name -> list of values)."""
     task: str
     model: str
     settings: dict
@@ -136,7 +190,7 @@ def make_choice(task: str, model: str, settings: dict | None = None) -> Choice:
         raise ChoiceError(f"task must be one of {list(PICK_BY)}")
     grid, available = {}, menu(task)
     if model not in available:
-        raise ChoiceError(f"{task} must be one of the {len(available)} scikit-learn {task}s on the menu "
+        raise ChoiceError(f"{task} must be one of the {len(available)} {task}s on the menu "
                           f"(python -m cb2.train --menu), not {model!r}")
     if not isinstance(settings or {}, dict):
         raise ChoiceError("settings must be an object of setting name -> value or list of values")
@@ -166,9 +220,7 @@ class NearestNeighbour:
         return self
 
     def predict(self, X):
-        shared = X @ self.X.T
-        either = X.sum(1)[:, None] + self.X.sum(1)[None, :] - shared
-        return self.y[np.argmax(shared / np.maximum(either, 1), axis=1)]
+        return self.y[np.argmax(tanimoto(X, self.X), axis=1)]
 
     def predict_proba(self, X):
         active = self.predict(X).astype(float)
@@ -413,8 +465,10 @@ def save(results: dict, predictions: pd.DataFrame, fitted: dict, source: Path, f
         "reason": reason,
         "settings": {"seed": SEED, "active_at": ACTIVE_AT, "sensitivity": list(SENSITIVITY), "folds": FOLDS,
                      "bootstraps": BOOTSTRAPS, "pick_by": PICK_BY, "fixed": FIXED, "max_settings": MAX_SETTINGS,
-                     "features_prepared": "missing values filled with the training median, then standard scaling"},
-        "versions": {"scikit-learn": sklearn.__version__, "rdkit": rdkit.__version__, "code": code_version()},
+                     "features_prepared": "missing values filled with the training median, then standard scaling "
+                                          "(not for the Tanimoto SVMs)"},
+        "versions": {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__, "rdkit": rdkit.__version__,
+                     "code": code_version()},
         "test_uses_before": uses_before,
         "sha256": {path.name: sha256(path) for path in sorted(folder.iterdir())},
     }
@@ -426,7 +480,7 @@ def save(results: dict, predictions: pd.DataFrame, fitted: dict, source: Path, f
 # --- Tools for the team: practice scores on the training part, and a proposal ---
 
 CHOICE_PROPERTIES = {
-    "model": {"type": "string", "description": "A scikit-learn model name from the menu"},
+    "model": {"type": "string", "description": "A model name from the menu"},
     "settings": {"type": "object", "description": ('Settings to try, name -> a value or a list of values, e.g. '
                                                    '{"C": [0.1, 1, 10]}. Settings left out keep the defaults')},
 }
@@ -579,7 +633,7 @@ if __name__ == "__main__":
     parser.add_argument("--menu", action="store_true", help="list every model on the menu")
     parser.add_argument("--features", choices=list(FEATURES))
     for task in ("classifier", "regressor"):
-        parser.add_argument(f"--{task}", help="a scikit-learn model name from the menu")
+        parser.add_argument(f"--{task}", help="a model name from the menu")
         parser.add_argument(f"--{task}-settings", type=json.loads, default=None,
                             help='settings to try as JSON, e.g. \'{"C": [0.1, 1, 10]}\'')
     parser.add_argument("--practice", action="store_true",

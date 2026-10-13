@@ -50,6 +50,7 @@ def test_the_menu_lists_scikit_learn_models_except_the_baselines():
     assert {"RandomForestClassifier", "LogisticRegression", "SVC", "KNeighborsClassifier", "MLPClassifier"} <= set(classifiers)
     assert {"RandomForestRegressor", "Ridge", "SVR", "KNeighborsRegressor", "MLPRegressor"} <= set(regressors)
     assert "DummyClassifier" not in classifiers and "DummyRegressor" not in regressors
+    assert {"XGBClassifier", "TanimotoSVC"} <= set(classifiers) and {"XGBRegressor", "TanimotoSVR"} <= set(regressors)
 
 
 def test_choices_are_checked_against_the_menu():
@@ -73,6 +74,21 @@ def test_nearest_neighbour_copies_the_most_similar_molecule():
     smiles = ("Cc1ccccc1", "CCCCO")
     model = train.NearestNeighbour().fit(train.matrix(smiles, "bits"), np.array([8.0, 5.0]))
     assert model.predict(train.matrix(("CCc1ccccc1", "CCCCCO"), "bits")).tolist() == [8.0, 5.0]
+
+
+def test_tanimoto_compares_which_fingerprint_bits_are_set():
+    X = np.array([[1, 1, 0, 0], [2, 1, 0, 0], [0, 0, 0, 0]])
+    Y = np.array([[1, 0, 1, 0], [1, 1, 0, 0]])
+    # Shared bits over bits set in either; counts only matter as present or not
+    np.testing.assert_allclose(train.tanimoto(X, Y), [[1 / 3, 1], [1 / 3, 1], [0, 0]])
+    # The SVMs compare the fingerprints themselves, so they skip the scaling step
+    assert len(train.build(train.TanimotoSVC, {}).steps) == 2 and len(train.build(train.SVC, {}).steps) == 3
+
+
+def test_tanimoto_models_refuse_features_that_are_not_fingerprints(table):
+    made = train.make_choice("regressor", "TanimotoSVR")
+    with pytest.raises(train.ChoiceError, match="needs morgan2 or morgan3 features"):
+        train.practice(train.training_part(table, "scaffold"), "scaffold", "descriptors", made)
 
 
 def test_scores_are_right_and_agree_with_sklearn():
@@ -101,6 +117,10 @@ def test_scores_are_right_and_agree_with_sklearn():
     ("classifier", "SVC", {"C": [0.1, 1.0]}),  # no probabilities: ranked by its own score
     ("classifier", "MLPClassifier", {"hidden_layer_sizes": [16], "max_iter": 50}),
     ("regressor", "MLPRegressor", {"hidden_layer_sizes": [16], "max_iter": 50}),
+    ("classifier", "XGBClassifier", {"n_estimators": 20, "max_depth": [2, 4]}),
+    ("regressor", "XGBRegressor", {"n_estimators": 20, "max_depth": [2, 4]}),
+    ("classifier", "TanimotoSVC", {"C": [0.1, 1.0]}),
+    ("regressor", "TanimotoSVR", {"C": [1.0, 10.0]}),
 ])
 def test_menu_models_practise_and_repeat_exactly(table, task, model, settings):
     part = train.training_part(table, "scaffold")
