@@ -1,7 +1,8 @@
+import pandas as pd
 import pytest
 
 from cb2 import data
-from tests.fakes import STATUS, TARGET, activity, assay
+from tests.fakes import STATUS, STRUCTURES, TARGET, activity, assay, compound
 
 
 @pytest.fixture
@@ -13,3 +14,9 @@ def save(tmp_path):
                   assays or [assay("CHEMBL_A1")], {"target_ids": ["CHEMBL253"], "reason": "test"})
         return folder
     return make
+
+
+@pytest.fixture
+def clean():
+    """A clean dataset of 47 compounds with values from 5 to 9."""
+    return pd.DataFrame([compound(n, smiles, 5 + n % 9 / 2) for n, smiles in enumerate(STRUCTURES, start=1)])

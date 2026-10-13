@@ -43,105 +43,45 @@ gpt-6-luna reviewing, a local auditor) keeps practice to fractions of a cent per
 
 ## Models
 
-By default **Claude** (claude-opus-5-5) plans, picks the data and explores, **GPT** (gpt-6-astra) reviews,
-and a local model (gemma4:26b) audits. Any role
-can be played by any model in `MODELS` in `cb2/llm.py`: Claude Opus, Sonnet or Haiku 5.5,
-GPT-6 Astra, Sol or Luna, or local models through [Ollama](https://ollama.com) (gemma4:26b, qwen3:14b).
-To use another local model, add one line there.
+`cb2/train.py` trains two separate models on a saved split: a **classifier** (active means
+pKi ≥ 7) and a **regressor** (the pKi itself). What is chosen and what is fixed:
 
-Choose per run, with effort levels for Claude and GPT (local models ignore effort):
+- **Chosen:** the features, and for each model any scikit-learn classifier or regressor on the
+  menu (`python -m cb2.train --menu` lists them), with the settings to try, e.g.
+  `{"C": [0.1, 1, 10]}`. The menu is built from scikit-learn itself: every model that can be
+  built with its defaults and passes a quick fit-and-predict check. Settings are checked against
+  the model's own list, and one choice may try at most 12 combinations.
+- **Fixed:** the seed (`random_state`, wherever a model has one), how features are prepared
+  (missing values filled with the training median, then scaled), 5-fold cross-validation inside
+  the training part to pick the best settings (by ROC AUC for the classifier, RMSE for the
+  regressor), the metrics (classifier: ROC AUC, average precision, balanced accuracy, MCC;
+  regressor: RMSE, MAE, R², Spearman) and the cutoff.
+- **Baselines:** every model is shown next to "always predict the commonest class / the average"
+  and "copy the most similar training molecule" (nearest neighbour by Tanimoto similarity).
+- **The test part is locked:** only the final evaluation reads it, and every time it does, a
+  line is added to `data/test-use.jsonl`. Test scores come with 95% bootstrap intervals.
+- **Sensitivity:** the classifier is also scored at cutoffs 6 and 8, with the settings chosen
+  at 7, to show whether conclusions depend on where the line is drawn.
 
-- **LangGraph Studio:** the settings form on the assistant (`planner_model`,
-  `planner_effort`, `reviewer_model`, `reviewer_effort`, `auditor_model`, `max_lookups`,
-  `fresh_download`, `practice`). Save combinations as assistants, e.g. a local-only team.
-- **Terminal:** `python -m cb2.graph --planner-model gemma4:26b --reviewer-effort high --budget 0.50`
-
-## Setup
-
-Needs Python 3.10+ and, for the local models, Ollama.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # then add your Anthropic and OpenAI API keys
+```
+python -m cb2.train data/split/<folder> --features morgan2 \
+  --classifier RandomForestClassifier --classifier-settings '{"n_estimators": 300, "n_jobs": -1}' \
+  --regressor SVR --regressor-settings '{"C": [1, 10]}' --practice
 ```
 
-Check that one model from each provider answers (or name models to try):
-
-```bash
-python -m cb2.llm
-```
-
-Approved downloads are saved in `data/raw/` (git ignores it), with a manifest recording
-the ChEMBL release and the proposal that was approved. A later run that approves exactly
-the same targets reuses the download unless `fresh_download` is set. To download targets
-yourself: `python -m cb2.data CHEMBL...`
-
-A download is checked every time it is loaded: every file must match the checksum in its
-manifest, the row counts must match, and no activity record may appear twice. If anything is
-off, the run stops and lists what is wrong. To check a download yourself:
-`python -m cb2.checks data/raw/<folder>`
-
-## Cleaning
-
-Cleaning turns a download into one row per compound with one value: pChEMBL, which is
--log10 of the value in molar (so pKi for Ki records). A **recipe** picks settings from a fixed
-menu; the steps, their order, the unit conversion and the bookkeeping are fixed in
-`cb2/clean.py`:
-
-```json
-{"targets": ["CHEMBL253"], "types": ["Ki"], "min_confidence": 9, "drop_flagged": true,
- "combine": "median", "max_spread": 1.0}
-```
-
-1. keep the chosen targets
-2. keep the chosen measurement types (from Ki, Kd, IC50)
-3. keep binding assays, at or above the minimum assay confidence (none, 8 or 9)
-4. drop records ChEMBL flags (validity warnings, potential duplicates), if chosen
-5. keep exact values (drops censored ones such as "> 10,000 nM")
-6. keep usable values (a value in nM above zero, a structure and a parent compound)
-7. combine repeat measurements of each parent compound (median or mean), dropping compounds
-   whose measurements are further apart than `max_spread` log units (0.5, 1.0, 1.5, or none)
-
-`python -m cb2.clean data/raw/<folder> recipe.json` (or `--dry-run` to only see the counts)
-saves `data/clean/<timestamp>/` with `clean.csv`, `dropped.csv` (every removed record, with
-its step and reason) and a manifest of the source download, recipe, code version, step-by-step
-counts and checksums. Before saving, the code checks that every record is either kept or dropped
-exactly once, that every step's counts add up, and that every value is between 2 and 12 and
-agrees with ChEMBL's own `pchembl_value`.
-
-## Molecules and splits
-
-Before modeling, `cb2/split.py` prepares a clean dataset and splits it. None of this is chosen
-by the team:
-
-- **Standardizing:** each structure keeps its largest piece (dropping salts and solvents) and
-  is neutralized. Compounds that turn out to be the same molecule are merged (median value), or
-  dropped if their values are further apart than the recipe's `max_spread`; unreadable
-  structures are dropped. Every compound is either in one molecule or dropped, exactly once.
-- **Scaffold split (the headline):** molecules are grouped by their ring system (Bemis–Murcko
-  scaffold), and whole groups go to training or test, so the test asks about new kinds of
-  molecule. About 20% go to test.
-- **Random split (for comparison):** the same, with every molecule its own group.
-- **Folds:** each split's training part is divided into 5 cross-validation folds, again
-  keeping groups together. A fixed seed makes all of it repeat exactly.
-
-`python -m cb2.split data/clean/<folder>` (or `--dry-run`) saves `data/split/<timestamp>/`
-with `molecules.csv` (each molecule's structure, value, scaffold, part and fold in both
-splits), `dropped.csv` and a manifest of the source, settings, RDKit and code versions, counts
-and checksums. It checks the clean dataset's checksums before reading it, and checks the splits
-(no group in both parts or in two folds, no test molecule in a fold) before saving.
-
-`cb2/features.py` turns structures into numbers, from a menu: Morgan fingerprint counts
-(radius 2 or 3, 2048 bits), RDKit descriptors, or both.
+With `--practice` it shows practice scores only (the test part stays closed). Without it, it
+trains on each split's whole training part, scores both splits' test parts and saves
+`data/models/<timestamp>/`: the scores, the test predictions, the fitted scaffold-split models
+and a manifest of the source split, choices, settings, library and code versions, how often this
+split's test part had been opened before, and checksums.
 
 ## Tests
 
 Run `pytest` (no API keys or internet needed). The cleaning tests use a small made-up table
 whose right answers were worked out by hand. Other tests break a download, the cleaning
-bookkeeping or the splits on purpose (a changed file, a repeated record, a lost dropped row, a value off the
-menu, ...) and check that the checks catch it.
+bookkeeping or the splits on purpose (a changed file, a repeated record, a lost dropped row, a
+value off the menu, ...) and check that the checks catch it, or change the test part's values
+and check that practice scores don't move.
 
 ## Costs
 

@@ -8,3 +8,4 @@ pandas>=3.0
 requests>=2.34
 pytest>=9.0
 rdkit>=2026.9
+scikit-learn>=1.9

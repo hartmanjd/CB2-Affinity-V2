@@ -7,21 +7,7 @@ import pytest
 from cb2 import split
 from cb2.checks import CheckFailed, sha256
 from cb2.features import DESCRIPTORS, FEATURES, featurize, standardize
-
-RINGS = ["c1ccccc1", "c1ccncc1", "c1ccc2ccccc2c1", "C1CCCCC1", "c1ccc2[nH]ccc2c1", "c1ccsc1"]
-SIDES = ["C", "CC", "O", "N", "Cl", "F", "OC"]
-CHAINS = ["CCCC", "CCO", "CCN", "CCCCO", "CC(C)C"]
-
-
-def compound(n: int, smiles: str, pchembl: float) -> dict:
-    return {"parent_molecule_chembl_id": f"CHEMBL{n:03d}", "canonical_smiles": smiles, "smiles_from": f"CHEMBL{n:03d}",
-            "pchembl": pchembl, "n_measurements": 1, "spread": 0.0, "activity_ids": json.dumps([n])}
-
-
-@pytest.fixture
-def clean():
-    structures = [side + ring for ring in RINGS for side in SIDES] + CHAINS
-    return pd.DataFrame([compound(n, smiles, 5 + n % 9 / 2) for n, smiles in enumerate(structures, start=1)])
+from tests.fakes import compound
 
 
 def test_standardize_keeps_the_largest_piece_neutral():
