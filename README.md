@@ -56,6 +56,12 @@ run behaves exactly the same, including real API costs and downloads, but logs t
 `practice-runs/`, which git ignores. A cheap team (e.g. claude-haiku-5-5 planning,
 gpt-6-luna reviewing, a local auditor) keeps practice to fractions of a cent per round.
 
+A run can also start from a clean dataset an earlier run saved: pass
+`--from data/clean/<folder>` (or fill in `start_from` in Studio). Before anything else, code
+checks every file in the folder against its manifest and stops the run if one has changed. The
+run then goes from the plan straight to the split and the model stage, skipping the download,
+exploring and cleaning; the run log says which dataset it started from.
+
 ## Models
 
 `cb2/train.py` trains two separate models on a saved split: a **classifier** (active means
