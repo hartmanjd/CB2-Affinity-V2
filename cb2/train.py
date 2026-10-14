@@ -2,7 +2,8 @@
 regressor (what is its pKi?).
 
 A researcher (or the team) chooses the features, any model on the menu (scikit-learn's, XGBoost's,
-or an SVM comparing molecules by Tanimoto similarity) and the settings to try. Everything that
+an SVM comparing molecules by Tanimoto similarity, or a PyTorch neural network) and the settings
+to try. Everything that
 decides how honest the scores are is fixed here: the splits and folds (made by cb2.split), the seed, how features
 are prepared, the metrics, the baselines and the test part. Choices are compared on practice
 scores from cross-validation inside the training part. Only `evaluate` reads the test part, and
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 import rdkit
 import sklearn
+import torch
 import xgboost
 from scipy.stats import rankdata, spearmanr
 from sklearn.dummy import DummyClassifier, DummyRegressor
@@ -37,6 +39,7 @@ from xgboost import XGBClassifier, XGBRegressor
 from cb2.checks import CheckFailed, sha256, verify_files
 from cb2.clean import ROOT, code_version, shown
 from cb2.features import FEATURES, featurize
+from cb2.network import TorchNetClassifier, TorchNetRegressor
 from cb2.split import ACTIVE_AT, FOLDS, GROUPS, SEED
 
 MODELS_DIR = ROOT / "data" / "models"
@@ -95,9 +98,12 @@ class TanimotoSVR(SVR):
                          cache_size=cache_size, max_iter=max_iter)
 
 
-# Offered next to scikit-learn's own models: the Tanimoto SVMs above, and XGBoost, which works the same way
-EXTRAS = {"classifier": [("TanimotoSVC", TanimotoSVC), ("XGBClassifier", XGBClassifier)],
-          "regressor": [("TanimotoSVR", TanimotoSVR), ("XGBRegressor", XGBRegressor)]}
+# Offered next to scikit-learn's own models: the Tanimoto SVMs above, XGBoost, and the PyTorch
+# network in cb2/network.py, all of which work the same way
+EXTRAS = {"classifier": [("TanimotoSVC", TanimotoSVC), ("XGBClassifier", XGBClassifier),
+                         ("TorchNetClassifier", TorchNetClassifier)],
+          "regressor": [("TanimotoSVR", TanimotoSVR), ("XGBRegressor", XGBRegressor),
+                        ("TorchNetRegressor", TorchNetRegressor)]}
 
 
 def build(estimator: type, setting: dict):
@@ -200,7 +206,7 @@ def make_choice(task: str, model: str, settings: dict | None = None) -> Choice:
         if name in FIXED:
             problems.append(f"{name} is set by the project")
         elif name not in known:
-            problems.append(f"{model} has no setting {name!r}")
+            problems.append(f"{model} has no setting {name!r} (its settings: {', '.join(known)})")
         elif not values or not all(v is None or isinstance(v, (bool, int, float, str)) for v in values):
             problems.append(f"{name} must be a number, text, true/false or null, or a list of them")
         grid = {**grid, name: values}
@@ -467,8 +473,8 @@ def save(results: dict, predictions: pd.DataFrame, fitted: dict, source: Path, f
                      "bootstraps": BOOTSTRAPS, "pick_by": PICK_BY, "fixed": FIXED, "max_settings": MAX_SETTINGS,
                      "features_prepared": "missing values filled with the training median, then standard scaling "
                                           "(not for the Tanimoto SVMs)"},
-        "versions": {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__, "rdkit": rdkit.__version__,
-                     "code": code_version()},
+        "versions": {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__, "torch": torch.__version__,
+                     "rdkit": rdkit.__version__, "code": code_version()},
         "test_uses_before": uses_before,
         "sha256": {path.name: sha256(path) for path in sorted(folder.iterdir())},
     }
@@ -618,8 +624,14 @@ def scores_entry(results: dict, look_id: str) -> dict:
 
 
 def menu_text() -> str:
-    return "\n\n".join(f"{task}s ({len(menu(task))}):\n  " + ", ".join(menu(task))
-                         for task in ("classifier", "regressor"))
+    """Every model on the menu. The project's own models are listed with their settings and
+    defaults, since nobody knows them from elsewhere."""
+    own = [f"  {name}: " + ", ".join(f"{key}={value!r}" for key, value in estimator().get_params().items()
+                                    if key not in FIXED)
+           for task in PICK_BY for name, estimator in EXTRAS[task]
+           if not estimator.__module__.startswith(("sklearn", "xgboost"))]
+    return "\n\n".join([f"{task}s ({len(menu(task))}):\n  " + ", ".join(menu(task)) for task in PICK_BY]
+                       + ["Settings of the project's own models (with their defaults):\n" + "\n".join(own)])
 
 
 if __name__ == "__main__":

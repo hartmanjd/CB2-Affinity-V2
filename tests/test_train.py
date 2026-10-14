@@ -50,7 +50,11 @@ def test_the_menu_lists_scikit_learn_models_except_the_baselines():
     assert {"RandomForestClassifier", "LogisticRegression", "SVC", "KNeighborsClassifier", "MLPClassifier"} <= set(classifiers)
     assert {"RandomForestRegressor", "Ridge", "SVR", "KNeighborsRegressor", "MLPRegressor"} <= set(regressors)
     assert "DummyClassifier" not in classifiers and "DummyRegressor" not in regressors
-    assert {"XGBClassifier", "TanimotoSVC"} <= set(classifiers) and {"XGBRegressor", "TanimotoSVR"} <= set(regressors)
+    assert {"XGBClassifier", "TanimotoSVC", "TorchNetClassifier"} <= set(classifiers)
+    assert {"XGBRegressor", "TanimotoSVR", "TorchNetRegressor"} <= set(regressors)
+    # The project's own models are listed with their settings, so they can be chosen without reading the code
+    assert ("TorchNetRegressor: batch_size=64, dropout=0.2, epochs=30, hidden_layers='256', learning_rate=0.001"
+            in train.menu_text())
 
 
 def test_choices_are_checked_against_the_menu():
@@ -121,6 +125,8 @@ def test_scores_are_right_and_agree_with_sklearn():
     ("regressor", "XGBRegressor", {"n_estimators": 20, "max_depth": [2, 4]}),
     ("classifier", "TanimotoSVC", {"C": [0.1, 1.0]}),
     ("regressor", "TanimotoSVR", {"C": [1.0, 10.0]}),
+    ("classifier", "TorchNetClassifier", {"hidden_layers": ["32", "32,16"], "epochs": 5}),
+    ("regressor", "TorchNetRegressor", {"hidden_layers": "32", "dropout": [0.0, 0.2], "epochs": 5}),
 ])
 def test_menu_models_practise_and_repeat_exactly(table, task, model, settings):
     part = train.training_part(table, "scaffold")
