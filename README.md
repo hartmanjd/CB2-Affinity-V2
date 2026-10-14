@@ -66,9 +66,11 @@ pKi ≥ 7) and a **regressor** (the pKi itself). What is chosen and what is fixe
   `{"C": [0.1, 1, 10]}`. The menu is built from scikit-learn itself, plus XGBoost's gradient
   boosting (`XGBClassifier`, `XGBRegressor`) and scikit-learn's SVMs comparing molecules by the
   Tanimoto similarity of their fingerprints (`TanimotoSVC`, `TanimotoSVR`, for morgan2 or morgan3
-  features): every model that can be built with its defaults and passes a quick fit-and-predict
-  check. Settings are checked against the model's own list, and one choice may try at most 12
-  combinations.
+  features) and a PyTorch neural network (`TorchNetClassifier`, `TorchNetRegressor`: layer sizes
+  such as `"512,256"`, dropout, learning rate, epochs and batch size): every model that can be
+  built with its defaults and passes a quick fit-and-predict check. Settings are checked against
+  the model's own list, and one choice may try at most 12 combinations. The network trains on one
+  thread with a fixed seed, so it gives the same result every time.
 - **Fixed:** the seed (`random_state`, wherever a model has one), how features are prepared
   (missing values filled with the training median, then scaled, except for the Tanimoto SVMs,
   which compare the fingerprints themselves), 5-fold cross-validation inside
@@ -93,6 +95,14 @@ trains on each split's whole training part, scores both splits' test parts and s
 `data/models/<timestamp>/`: the scores, the test predictions, the fitted scaffold-split models
 and a manifest of the source split, choices, settings, library and code versions, how often this
 split's test part had been opened before, and checksums.
+
+The network runs on the CPU, so the much smaller CPU-only PyTorch is enough. Installing it before
+the other requirements keeps pip from fetching the larger default build:
+
+```
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
 
 ## Tests
 
