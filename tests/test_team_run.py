@@ -10,11 +10,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from cb2 import graph, runlog, split, train
+from cb2.checks import CheckFailed
 from cb2.llm import usage_record
 from tests.fakes import TARGET, activity
 from tests.test_clean import RECIPE, ROWS
 
 USAGE = usage_record("claude-haiku-5-5", 0.1, 10, 10)
+REAL_LOAD_CLEAN = split.load_clean
 MODELS = {"features": "morgan2", "classifier": {"model": "LogisticRegression", "settings": {"C": [0.1, 1.0]}},
           "regressor": {"model": "Ridge", "settings": {"alpha": [1.0, 10.0]}}, "reason": "simple models first"}
 
@@ -61,11 +63,11 @@ def team(save, clean, tmp_path, monkeypatch):
     return team
 
 
-def run(answers: list[str]):
+def run(answers: list[str], **inputs):
     """Run the whole graph, answering each pause in turn; returns the final state and the pauses seen."""
     app = graph.make_builder().compile(checkpointer=InMemorySaver())
     config, settings = {"configurable": {"thread_id": "test"}}, graph.Settings(practice=True)
-    result, pauses = app.invoke({"question": "q"}, config, context=settings), []
+    result, pauses = app.invoke({"question": "q", **inputs}, config, context=settings), []
     for answer in answers:
         pauses.append(result["__interrupt__"][0].value)
         result = app.invoke(Command(resume=answer), config, context=settings)
@@ -157,3 +159,30 @@ def test_an_off_menu_model_is_not_proposed(team, tmp_path):
     # Approving without a proposal sends the planner back to propose one
     assert pauses[-1]["Models"] == "(no models proposed)" and result["models_feedback"] == "stop"
     assert not train.TEST_LOG.exists()
+
+
+def test_a_run_can_start_from_a_saved_dataset(team, tmp_path, monkeypatch):
+    monkeypatch.setattr(graph.data, "find_download", lambda target_ids: pytest.fail("nothing should be downloaded"))
+    saved = tmp_path / "saved"
+    saved.mkdir()
+    (saved / "manifest.json").write_text("{}")
+    result, pauses = run(["approve"] * 3, start_from=str(saved))
+    # Straight from the plan to the models: no download, no exploring, no recipe
+    assert [pause["kind"] for pause in pauses] == ["plan", "model", "results"]
+    assert result["clean_folder"] == str(saved.resolve()) and "data_folder" not in result
+    assert Path(result["models_folder"]).exists()
+    assert [kind for kind, _ in ledger_kinds(result)][0] == "split"
+
+    log = (tmp_path / "practice-runs" / result["run_id"] / "log.md").read_text()
+    assert log.index("Started from the saved dataset") < log.index("Round 1 · Plan") < log.index("## The split")
+
+
+def test_a_changed_saved_dataset_stops_the_run_before_any_model_is_asked(team, tmp_path, monkeypatch):
+    monkeypatch.setattr(split, "load_clean", REAL_LOAD_CLEAN)
+    monkeypatch.setattr(graph, "ask", lambda *args, **kwargs: pytest.fail("no model should be asked"))
+    folder = tmp_path / "saved"
+    folder.mkdir()
+    (folder / "clean.csv").write_text("parent_molecule_chembl_id,pchembl\nCHEMBL1,7.0\n")
+    (folder / "manifest.json").write_text(json.dumps({"rows": {"compounds": 1}, "sha256": {"clean.csv": "0" * 64}}))
+    with pytest.raises(CheckFailed, match="clean.csv has changed since it was saved"):
+        run([], start_from=str(folder))

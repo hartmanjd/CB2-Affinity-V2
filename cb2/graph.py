@@ -14,6 +14,8 @@ tries of its own) and the auditor checks every number. Once the lead approves, c
 models and scores them once on the test part.
 Stage 6, conclusions: the planner writes what the test scores say; the reviewer critiques it and
 the auditor checks every number against the scores.
+A run can also start from a dataset saved by an earlier run: it is checked against its manifest,
+then the run goes from the plan straight to the split, skipping stages 2 to 4.
 Every stage is the same loop, built once by make_stage and used six times as a subgraph:
 budget check → worker → reviewer → (auditor) → the lead's approval → back round, or on to the
 next stage. Every pause is written to the run log in runs/."""
@@ -470,6 +472,8 @@ def grow(existing: list, new: list) -> list:
 # The shared notebook every node reads from and writes to
 class State(TypedDict, total=False):
     question: str
+    # A saved clean dataset to start from (data/clean/<stamp>), instead of downloading and cleaning
+    start_from: str
     run_id: str
     stage: Literal["plan", "source", "data", "clean", "model", "results"]
     # Counts rounds across all stages; every cost record says which round it belongs to
@@ -541,6 +545,10 @@ def pause(state: State, runtime: Runtime[Settings], kind: str, sections: dict[st
 
 # --- The loop every stage shares ---
 
+def new_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
 def make_budget_gate(stage: str, worker: str):
     def budget_gate(state: State, runtime: Runtime[Settings]) -> Command:
         settings = runtime.context or Settings()
@@ -550,7 +558,7 @@ def make_budget_gate(stage: str, worker: str):
             "budget": state.get("budget", DEFAULT_BUDGET),
             "stage": stage,
             "question": state.get("question") or DEFAULT_QUESTION,
-            "run_id": state.get("run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ"),
+            "run_id": state.get("run_id") or new_run_id(),
         }
 
         # Guess the next round costs about what this stage's last round did (nothing to go on before the first)
@@ -873,6 +881,19 @@ def make_dataset(state: State, runtime: Runtime[Settings]) -> dict:
     return {"clean_folder": str(folder), "history": [record(state, runtime, "dataset", [("Steps", text)])]}
 
 
+def use_dataset(state: State, runtime: Runtime[Settings]) -> dict:
+    """Code, not an agent: check a saved dataset before anything else runs, so a changed file stops
+    the run before any money is spent."""
+    folder = Path(state["start_from"]).resolve()
+    table, manifest = split.load_clean(folder)
+    state = {**state, "question": state.get("question") or DEFAULT_QUESTION, "run_id": new_run_id(), "round": 0}
+    text = (f"Started from the saved dataset {clean.shown(folder)}: {len(table):,} compounds, every file matches "
+            f"its manifest.\nMade by run {manifest.get('run') or '(none recorded)'}"
+            f"{', recipe reason: ' + manifest['reason'] if manifest.get('reason') else ''}")
+    item = record(state, runtime, "dataset", [("Steps", text)])
+    return {"question": state["question"], "run_id": state["run_id"], "clean_folder": str(folder), "history": [item]}
+
+
 def make_split(state: State, runtime: Runtime[Settings]) -> dict:
     """Code, not an agent: standardize the dataset's molecules and split them, the same way every time."""
     source = Path(state["clean_folder"])
@@ -880,7 +901,7 @@ def make_split(state: State, runtime: Runtime[Settings]) -> dict:
     molecules, dropped = split.prepare(table, manifest["recipe"]["max_spread"])
     splits = split.make_splits(molecules)
     folder = split.save(splits, dropped, source, state["run_id"])
-    entry = {**split.summary_entry(splits, dropped, len(table), f"L{len(state['ledger']) + 1}"),
+    entry = {**split.summary_entry(splits, dropped, len(table), f"L{len(state.get('ledger', [])) + 1}"),
              "by": "split", "round": state["round"]}
     item = record(state, runtime, "split", [("Steps", f"Saved to {clean.shown(folder)}\n\n{entry['text']}")], [entry])
     return {"split_folder": str(folder), "split_id": entry["id"], "ledger": [entry], "history": [item]}
@@ -1035,6 +1056,7 @@ def make_builder() -> StateGraph:
         audit_sections=lambda state: {"Conclusions": state["conclusions"], "Review": state["conclusions_review"]})
 
     builder = StateGraph(State, context_schema=Settings)
+    builder.add_node("use_dataset", use_dataset)
     builder.add_node("plan", plan)
     builder.add_node("get_data", get_data)
     builder.add_node("download", download)
@@ -1046,8 +1068,13 @@ def make_builder() -> StateGraph:
     builder.add_node("train_and_test", train_and_test)
     builder.add_node("results", conclude)
     # Each stage ends either approved (go on) or stopped at the budget (end the run)
-    builder.add_edge(START, "plan")
-    builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else "get_data", ["get_data", END])
+    builder.add_conditional_edges(START, lambda state: "use_dataset" if state.get("start_from") else "plan",
+                                  ["use_dataset", "plan"])
+    builder.add_edge("use_dataset", "plan")
+    # A run that started from a saved dataset goes from the plan straight to the split
+    builder.add_conditional_edges("plan", lambda state: END if state.get("stopped") else
+                                  "make_split" if state.get("start_from") else "get_data",
+                                  ["get_data", "make_split", END])
     builder.add_conditional_edges("get_data", lambda state: END if state.get("stopped") else "download", ["download", END])
     builder.add_edge("download", "explore")
     builder.add_conditional_edges("explore", lambda state: END if state.get("stopped") else "clean", ["clean", END])
@@ -1068,7 +1095,7 @@ def build_graph():
 
 
 if __name__ == "__main__":
-    # Usage: python -m cb2.graph [--planner-model gemma4:26b] [--budget 0.50] ...
+    # Usage: python -m cb2.graph [--planner-model gemma4:26b] [--budget 0.50] [--from data/clean/<folder>] ...
     parser = argparse.ArgumentParser(description="Run the research team from the terminal.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--planner-model", default=Settings.planner_model, choices=list(MODELS))
@@ -1077,7 +1104,10 @@ if __name__ == "__main__":
     parser.add_argument("--reviewer-effort", default="default", choices=["default", *EFFORTS])
     parser.add_argument("--auditor-model", default=Settings.auditor_model, choices=list(MODELS))
     parser.add_argument("--max-lookups", type=int, default=Settings.max_lookups)
-    parser.add_argument("--fresh-download", action="store_true")
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument("--fresh-download", action="store_true")
+    start.add_argument("--from", dest="start_from", metavar="data/clean/<folder>",
+                       help="start from a saved clean dataset instead of downloading and cleaning")
     parser.add_argument("--practice", action="store_true", help="log to practice-runs/, which git ignores")
     parser.add_argument("--max-try-minutes", type=float, default=Settings.max_try_minutes)
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
@@ -1088,7 +1118,10 @@ if __name__ == "__main__":
 
     graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}
-    result = graph.invoke({"question": args.question, "budget": args.budget}, config, context=settings)
+    inputs = {"question": args.question, "budget": args.budget}
+    if args.start_from:
+        inputs["start_from"] = args.start_from
+    result = graph.invoke(inputs, config, context=settings)
     # Each pause shows what the team produced and asks for an answer; resuming runs to the next pause
     while "__interrupt__" in result:
         pause_value = result["__interrupt__"][0].value
