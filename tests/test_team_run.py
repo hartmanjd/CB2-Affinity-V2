@@ -63,10 +63,10 @@ def team(save, clean, tmp_path, monkeypatch):
     return team
 
 
-def run(answers: list[str], **inputs):
+def run(answers: list[str], settings=None, **inputs):
     """Run the whole graph, answering each pause in turn; returns the final state and the pauses seen."""
     app = graph.make_builder().compile(checkpointer=InMemorySaver())
-    config, settings = {"configurable": {"thread_id": "test"}}, graph.Settings(practice=True)
+    config, settings = {"configurable": {"thread_id": "test"}}, settings or graph.Settings(practice=True)
     result, pauses = app.invoke({"question": "q", **inputs}, config, context=settings), []
     for answer in answers:
         pauses.append(result["__interrupt__"][0].value)
@@ -134,7 +134,12 @@ def test_an_approved_run_ends_with_trained_models(team, tmp_path):
 
     kinds = ledger_kinds(result)
     assert {("split", "split"), ("try_models", "modeler"), ("try_models", "reviewer"),
-            ("test_scores", "train_and_test")} <= set(kinds)
+            ("propose_models", "modeler"), ("test_scores", "train_and_test")} <= set(kinds)
+    # The proposal's practice scores are a lookup the summary can cite, and tries record their time
+    proposal = next(e for e in result["ledger"] if e["request"]["kind"] == "propose_models")
+    assert team["replies"][1].startswith(f"Models recorded as {proposal['id']}")
+    assert "regressor | Ridge | rmse mean" in proposal["numbers"] and "numbers" not in result["models"]
+    assert all("try seconds" in e["numbers"] for e in result["ledger"] if e["request"]["kind"] == "try_models")
     split_entry, scores = (next(e for e in result["ledger"] if e["request"]["kind"] == kind)
                            for kind in ("split", "test_scores"))
     assert split_entry["numbers"]["molecules"] == 47
@@ -186,3 +191,18 @@ def test_a_changed_saved_dataset_stops_the_run_before_any_model_is_asked(team, t
     (folder / "manifest.json").write_text(json.dumps({"rows": {"compounds": 1}, "sha256": {"clean.csv": "0" * 64}}))
     with pytest.raises(CheckFailed, match="clean.csv has changed since it was saved"):
         run([], start_from=str(folder))
+
+
+def test_ok_yes_and_continue_mean_approve(team):
+    _, pauses = run(["Continue", "yes", "ok.", "OK", "approve", "y"])
+    assert [pause["kind"] for pause in pauses] == ["plan", "source", "data", "clean", "model", "results"]
+
+
+def test_auto_approve_revises_the_plan_then_runs_to_the_end(team, tmp_path):
+    result, _ = run([], graph.Settings(practice=True, auto_approve=True))
+    rounds = [item["stage"] for item in result["history"] if item["stage"] not in ("budget", *graph.runlog.CODE_STEPS)]
+    # Three rounds of planning and review, then one round of each other stage
+    assert rounds == ["plan", "plan", "plan", "source", "data", "clean", "model", "results"]
+    assert Path(result["models_folder"]).exists() and result["results_feedback"] == "approve"
+    log = (tmp_path / "practice-runs" / result["run_id"] / "log.md").read_text()
+    assert log.count("*(answered automatically)*") == 8 and "(blank: revise from the review)" in log

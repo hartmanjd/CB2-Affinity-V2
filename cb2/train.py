@@ -225,12 +225,20 @@ class NearestNeighbour:
         self.X, self.y = X, np.asarray(y)
         return self
 
+    def nearest(self, X) -> tuple[np.ndarray, np.ndarray]:
+        similarity = tanimoto(X, self.X)
+        closest = np.argmax(similarity, axis=1)
+        return self.y[closest], similarity[np.arange(len(X)), closest]
+
     def predict(self, X):
-        return self.y[np.argmax(tanimoto(X, self.X), axis=1)]
+        return self.nearest(X)[0]
 
     def predict_proba(self, X):
-        active = self.predict(X).astype(float)
-        return np.column_stack([1 - active, active])
+        # The yes/no call is the neighbour's; the closer the neighbour, the surer the score, so
+        # ROC AUC ranks molecules rather than only scoring the calls
+        active, similarity = self.nearest(X)
+        score = 0.5 + 0.5 * similarity * np.where(active == 1, 1, -1)
+        return np.column_stack([1 - score, score])
 
 
 # name: (description, {task: make a model}, the features it uses)
@@ -573,7 +581,8 @@ def try_models(folder: Path, request: dict, look_id: str, minutes: float | None 
     rows = {choice.model: result["scores"], **baselines}
     numbers = numbered({f"{name} | {score} {stat}": value for name, row in rows.items()
                         for score, values in row.items() for stat, value in values.items()}
-                       | {f"setting {i} | {metric}": tried[metric] for i, tried in enumerate(result["each"], 1)})
+                       | {f"setting {i} | {metric}": tried[metric] for i, tried in enumerate(result["each"], 1)}
+                       | {"try seconds": result["seconds"], "try minutes": result["seconds"] / 60})
     each = "\n".join(f"  {i}. {tried['settings'] or 'defaults'}: {metric} {tried[metric]:.3f}"
                      for i, tried in enumerate(result["each"], 1))
     text = (f"{look_id} try_models {choice.task} {choice.model} on {features}, {HEADLINE} split, training part "
@@ -586,13 +595,16 @@ def try_models(folder: Path, request: dict, look_id: str, minutes: float | None 
 
 def propose(folder: Path, request: dict, minutes: float | None = TRY_MINUTES) -> dict:
     """A proposal checked against the menu, with practice scores for the lead and how long training
-    and testing should take, computed by code."""
-    features, proposal, tables, timings = str(request.get("features")), {}, [], {}
+    and testing should take, computed by code. Its numbers are for a ledger entry."""
+    features, proposal, tables, timings, numbers = str(request.get("features")), {}, [], {}, {}
     for task in PICK_BY:
         part = request.get(task) if isinstance(request.get(task), dict) else {"model": request.get(task)}
         choice = make_choice(task, str(part.get("model")), part.get("settings"))
         result, baselines = practice_for(folder, features, choice, minutes)
         proposal[task], timings[task] = asdict(choice), result
+        rows = {choice.model: result["scores"], **baselines}
+        numbers |= {f"{task} | {name} | {score} {stat}": value for name, row in rows.items()
+                    for score, values in row.items() for stat, value in values.items()}
         tables.append(f"{task}, best of {result['tried']} settings: {result['settings'] or 'defaults'}\n"
                       + practice_text({choice.model: result}, baselines))
     heading = f"Practice scores ({HEADLINE} split, training part, mean ± sd over {FOLDS} folds):\n\n"
@@ -601,7 +613,7 @@ def propose(folder: Path, request: dict, minutes: float | None = TRY_MINUTES) ->
     estimate = (f"\n\nTraining and testing should take about {duration(seconds)} on this computer (a rough "
                 "estimate from the practice timings). It runs here and has no API cost.")
     return {"features": features, **proposal, "reason": str(request.get("reason", "")),
-            "practice": heading + "\n\n".join(tables) + estimate}
+            "practice": heading + "\n\n".join(tables) + estimate, "numbers": numbered(numbers)}
 
 
 def choices(proposal: dict) -> tuple[Choice, Choice]:

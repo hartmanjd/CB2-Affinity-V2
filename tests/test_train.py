@@ -80,6 +80,16 @@ def test_nearest_neighbour_copies_the_most_similar_molecule():
     assert model.predict(train.matrix(("CCc1ccccc1", "CCCCCO"), "bits")).tolist() == [8.0, 5.0]
 
 
+def test_nearest_neighbour_scores_rank_by_how_close_the_neighbour_is():
+    smiles = ("Cc1ccccc1", "CCCCO")
+    model = train.NearestNeighbour().fit(train.matrix(smiles, "bits"), np.array([1, 0]))
+    X = train.matrix(("Cc1ccccc1", "CCc1ccccc1", "CCCCCO", "CCCCO"), "bits")
+    score = model.predict_proba(X)[:, 1]
+    # The calls stay the neighbour's; a closer active neighbour scores higher, a closer inactive one lower
+    assert model.predict(X).tolist() == [1, 1, 0, 0] and (score[:2] > 0.5).all() and (score[2:] < 0.5).all()
+    assert score[0] == 1.0 and score[0] > score[1] and score[2] > score[3] == 0.0
+
+
 def test_tanimoto_compares_which_fingerprint_bits_are_set():
     X = np.array([[1, 1, 0, 0], [2, 1, 0, 0], [0, 0, 0, 0]])
     Y = np.array([[1, 0, 1, 0], [1, 1, 0, 0]])

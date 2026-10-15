@@ -43,8 +43,26 @@ from cb2.looks import LOOK_TOOL, LookError, look, overview
 # The prompts only say the study uses ChEMBL data; the question decides what it is about
 DEFAULT_QUESTION = "Which ligand features predict high binding affinity at the CB2 receptor?"
 
+# What code fixes, so plans don't promise what the tools won't do
+FIXED_RULES = """What the study's code fixes, which the plan must work within:
+- Cleaning keeps exact values only: censored values such as "> 10,000 nM" are dropped. Each
+  compound gets one value (pKi for Ki records); compounds that are the same molecule are merged.
+- Two splits, each holding out {test:.0%} of the molecules as a locked test part that is scored
+  once: by scaffold (the headline) and at random (for comparison), with {folds} folds of the
+  training part for practice scores and seed {seed}. There are no other splits, such as by time.
+- Two separate models: a classifier, where active means pKi >= {active:g} ({nM:g} nM or stronger),
+  also checked at pKi {sensitivity}; and a regressor that predicts pKi. The team chooses the
+  features, the models and their settings from menus.
+- Baselines: always guessing the commonest class or the average, and copying the most similar
+  training molecule. Scores: ROC AUC, average precision, balanced accuracy and MCC for the
+  classifier; RMSE, MAE, R² and Spearman for the regressor; each test score with a 95% interval.""".format(
+    test=split.TEST_FRACTION, folds=split.FOLDS, seed=split.SEED, active=split.ACTIVE_AT,
+    nM=10 ** (9 - split.ACTIVE_AT), sensitivity=" and ".join(f"{cutoff:g}" for cutoff in train.SENSITIVITY))
+
 PLANNER_PROMPT = """You are planning a small study that will only use data downloaded from
 ChEMBL and analysed in Python.
+
+""" + FIXED_RULES + """
 
 Write a short research plan (3 to 5 numbered steps) for this question:
 
@@ -73,7 +91,10 @@ Question: {question}
 Plan:
 {plan}
 
-List the three most important weaknesses or risks in this plan, one or two sentences each."""
+""" + FIXED_RULES + """
+
+List the three most important weaknesses or risks in this plan, one or two sentences each. Don't
+ask for what the code rules out; point out anything in the plan that it can't do."""
 
 SOURCE_PROMPT = """You are the planner of a small study using data from ChEMBL, analysed in Python.
 
@@ -425,10 +446,16 @@ REVIEWER_LOOKUPS = 5
 
 # Used when the lead leaves the answer blank: revise from the critique alone
 NO_FEEDBACK = "None given. Address the most important points of the critique."
-ANSWER_PROMPT = ("Type 'approve' to go on, write feedback (or leave it blank to revise from the review) "
+ANSWER_PROMPT = ("Type 'approve' (or 'ok') to go on, write feedback (or leave it blank to revise from the review) "
                  "for another round, or 'stop' to end the run")
 # Answers at an approval pause that end the run
 STOP_WORDS = ("stop", "end")
+# Answers that mean go on: anything else is feedback, and feedback starts another (paid) round
+APPROVE_WORDS = ("approve", "approved", "yes", "y", "ok", "okay", "continue", "go on", "next")
+
+
+def one_of(answer: str, words: tuple[str, ...]) -> bool:
+    return answer.lower().strip(" .!'\"") in words
 
 
 ModelName = Literal[tuple(MODELS)]
@@ -453,6 +480,10 @@ class Settings:
     practice: bool = False
     # The longest one try of models may take; a try that would run longer is stopped early
     max_try_minutes: float = train.TRY_MINUTES
+    # Answer every approval pause automatically: the plan is revised from the review until it has had
+    # auto_plan_rounds rounds, every other stage is approved after one. Budget pauses still ask you
+    auto_approve: bool = False
+    auto_plan_rounds: int = 3
 
 
 def effort(value: str) -> str | None:
@@ -529,15 +560,18 @@ def cost_record(node: str, state: State, usage: dict) -> dict:
 
 
 def pause(state: State, runtime: Runtime[Settings], kind: str, sections: dict[str, str],
-          how_to_answer: str | None = None) -> tuple[str, dict]:
-    """Show sections to the lead and wait for an answer; log the round before and after.
-    how_to_answer is shown with the pause but not written to the log."""
+          how_to_answer: str | None = None, auto_answer: str | None = None) -> tuple[str, dict]:
+    """Show sections to the lead and wait for an answer (or take auto_answer); log the round before
+    and after. how_to_answer is shown with the pause but not written to the log."""
     item = runlog.entry(kind, state.get("round", 0), list(sections.items()))
     history = state.get("history", [])
     args = (state["run_id"], state["question"], runtime.context or Settings())
     runlog.write(*args, history + [item], state.get("ledger", []))
-    shown = {"kind": kind, **sections, **({"How to answer": how_to_answer} if how_to_answer else {})}
-    answer = str(interrupt(shown) or "").strip()
+    if auto_answer is None:
+        shown = {"kind": kind, **sections, **({"How to answer": how_to_answer} if how_to_answer else {})}
+        answer = str(interrupt(shown) or "").strip()
+    else:
+        answer, item["auto"] = auto_answer, True
     item["feedback"] = answer
     runlog.write(*args, history + [item], state.get("ledger", []))
     return answer, item
@@ -593,11 +627,18 @@ def make_auditor(sections):
 def make_approval(stage: str, feedback_key: str, sections, not_ready=lambda state: None):
     """not_ready(state) can return a reason the lead can't approve yet; it becomes the feedback."""
     def approval(state: State, runtime: Runtime[Settings]) -> dict:
+        settings = runtime.context or Settings()
+        auto_answer = None
+        if settings.auto_approve:
+            # Blank means revise from the review
+            rounds = 1 + sum(item["stage"] == stage for item in state.get("history", []))
+            auto_answer = "" if stage == "plan" and rounds < settings.auto_plan_rounds else "approve"
         answer, item = pause(state, runtime, stage, {
-            **sections(state), "Costs": summary(state["costs"], state["round"], state["budget"])}, ANSWER_PROMPT)
-        if answer.lower() in STOP_WORDS:
+            **sections(state), "Costs": summary(state["costs"], state["round"], state["budget"])}, ANSWER_PROMPT,
+            auto_answer)
+        if one_of(answer, STOP_WORDS):
             return {feedback_key: answer, "approved": False, "stopped": True, "history": [item]}
-        approved = answer.lower() == "approve"
+        approved = one_of(answer, APPROVE_WORDS)
         reason = not_ready(state) if approved else None
         if reason:
             approved, answer = False, reason
@@ -936,10 +977,18 @@ def modeler(state: State, runtime: Runtime[Settings]) -> dict:
         if name != "propose_models":
             return run_lookup(name, request)
         try:
-            proposal.update(train.propose(Path(state["split_folder"]), request, settings.max_try_minutes))
+            proposed = train.propose(Path(state["split_folder"]), request, settings.max_try_minutes)
         except train.ChoiceError as error:
             return f"Not proposed: {error}"
-        return "Models recorded:\n" + format_models(proposal) + "\nNow write your summary for the lead."
+        # The practice scores become a lookup, so the summary can cite them
+        look_id = f"L{len(ledger) + 1}"
+        ledger.append({"id": look_id, "request": {"kind": "propose_models", **request},
+                       "numbers": proposed.pop("numbers"), "text": f"{look_id} {proposed['practice']}",
+                       "by": "modeler", "round": state["round"]})
+        proposal.clear()
+        proposal.update(proposed)
+        return (f"Models recorded as {look_id} (cite it for these practice scores):\n" + format_models(proposal)
+                + "\nNow write your summary for the lead.")
 
     fields = dict(**about_modeling(state), active_at=split.ACTIVE_AT, max_settings=train.MAX_SETTINGS,
                   features="\n".join(f"  {name}: {description}" for name, (description, _) in FEATURES.items()),
@@ -1110,11 +1159,15 @@ if __name__ == "__main__":
                        help="start from a saved clean dataset instead of downloading and cleaning")
     parser.add_argument("--practice", action="store_true", help="log to practice-runs/, which git ignores")
     parser.add_argument("--max-try-minutes", type=float, default=Settings.max_try_minutes)
+    parser.add_argument("--auto-approve", action="store_true",
+                        help="answer every approval pause for you (budget pauses still ask)")
+    parser.add_argument("--auto-plan-rounds", type=int, default=Settings.auto_plan_rounds,
+                        help="with --auto-approve, rounds of planning and review before the plan is approved")
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET, help="dollars")
     args = parser.parse_args()
     settings = Settings(args.planner_model, args.planner_effort, args.reviewer_model, args.reviewer_effort,
                         args.auditor_model, args.max_lookups, args.fresh_download, args.practice,
-                        args.max_try_minutes)
+                        args.max_try_minutes, args.auto_approve, args.auto_plan_rounds)
 
     graph = make_builder().compile(checkpointer=InMemorySaver())
     config = {"configurable": {"thread_id": "cli"}}
