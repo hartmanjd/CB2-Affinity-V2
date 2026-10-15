@@ -88,15 +88,22 @@ def decimals(text: str) -> int:
 def matches(claimed: float, actual: float, text: str, approximate: bool) -> bool:
     if approximate:
         return math.isclose(claimed, actual, rel_tol=0.05)
-    # Exact to the digits written: rounded or cut short both count ("15.2%" or "15%" for 15.23,
-    # "66%" for 66.8), but not off by a whole unit of the last digit
-    return abs(claimed - actual) < 10 ** -decimals(text) or math.isclose(claimed, actual, rel_tol=1e-9)
+    # Exact to the digits written: "15.2%" or "15%" for 15.23, but not "5" for 4.02
+    return abs(claimed - actual) <= 0.5 * 10 ** -decimals(text) + 1e-9 * max(1.0, abs(actual))
+
+
+def words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
 def label_overlap(name: str, sentence: str) -> int:
     # How many words of a ledger entry's label (e.g. "CHEMBL2096981 | Ki") appear in the sentence
-    words = set(re.findall(r"[a-z0-9]+", sentence.lower()))
-    return sum(word in words for word in re.findall(r"[a-z0-9]+", name.lower()))
+    return len(words(name) & words(sentence))
+
+
+def measure(name: str) -> str:
+    # The last part of a label says what was measured: "XGBClassifier | roc_auc mean" -> "roc_auc mean"
+    return name.rsplit(" | ", 1)[-1]
 
 
 def said_approximately(text: str, sentence_block: str) -> bool:
@@ -105,8 +112,34 @@ def said_approximately(text: str, sentence_block: str) -> bool:
     return position > 0 and bool(APPROXIMATE.search(sentence_block[max(0, position - 15):position]))
 
 
-def check(label: dict, sentence_block: str, ledger: dict[str, dict]) -> tuple[str, str] | None:
-    """Returns (mark, explanation) for one labelled number, or None to leave it out of the report."""
+def candidates(entry: dict, percent: bool) -> dict[str, float]:
+    numbers = entry["numbers"]
+    if not percent:
+        return numbers
+    # A percentage must be one number in the look as a share of another
+    return {f"{part} of {whole}": 100 * numbers[part] / numbers[whole] for part in numbers for whole in numbers
+            if numbers[whole] and 0 <= numbers[part] <= numbers[whole] and part != whole}
+
+
+def calculated(claimed: float, text: str, approximate: bool, cells: list[tuple[str, str, float]]):
+    """A difference of two numbers that measure the same thing (4,040 compounds in one look and
+    3,996 in another), or a sum of two counts. Pairing unrelated numbers would match almost anything."""
+    for i, (look_a, name_a, a) in enumerate(cells):
+        for look_b, name_b, b in cells[i + 1:]:
+            if measure(name_a) != measure(name_b):
+                continue
+            sums = [(a + b, "+")] if float(a).is_integer() and float(b).is_integer() else []
+            for result, sign in sums + [(abs(a - b), "−")]:
+                if matches(claimed, result, text, approximate):
+                    first, second = ((look_a, name_a), (look_b, name_b)) if sign == "+" or a >= b else \
+                        ((look_b, name_b), (look_a, name_a))
+                    return f"{first[0]}: {first[1]} {sign} {second[0]}: {second[1]}"
+    return None
+
+
+def check(label: dict, sentence_block: str, ledger: dict[str, dict], section_looks=()) -> tuple[str, str] | None:
+    """Returns (mark, explanation) for one labelled number, or None to leave it out of the report.
+    section_looks are the looks cited anywhere in the same text, for a number cited to the wrong one."""
     quote, text = label["quote"], label["text"]
     if not text.strip() or not quote.strip():
         return None
@@ -122,46 +155,42 @@ def check(label: dict, sentence_block: str, ledger: dict[str, dict]) -> tuple[st
     claimed = parse_number(text)
     if claimed is None:
         return "?", "couldn't read the number"
-    # Only trust a look id the text really cites; a model can invent one. If the model gave none,
-    # use the looks cited in the same sentence
-    # Check the look the model named first (if the text really cites it), then any other look
-    # cited in the same sentence
+    # Check the look the model named first (if the text really cites it), then any other look cited
+    # in the same sentence; a model can invent a look id
     look_id = label["look"].strip("[] ")
     sentence = next((line for line in sentence_block.splitlines() if normalize(quote) in normalize(line)), "")
     named = [look_id] if look_id and re.search(rf"\b{re.escape(look_id)}\b", sentence_block) else []
     look_ids = [look_id for look_id in dict.fromkeys(named + LOOK_REF.findall(sentence)) if look_id in ledger]
     if not look_ids:
         return "!", "a claim about the data with no lookup cited"
-    closest = None
-    for look_id in look_ids:
-        numbers = ledger[look_id]["numbers"]
-        if label["percent"]:
-            # A percentage must be one number in the look as a share of another
-            candidates = {f"{part} of {whole}": 100 * numbers[part] / numbers[whole]
-                          for part in numbers for whole in numbers
-                          if numbers[whole] and 0 <= numbers[part] <= numbers[whole] and part != whole}
-        else:
-            candidates = numbers
-        # Several entries can share a value: prefer the one whose label words appear in the sentence,
-        # so "25 Ki" for a target matches that target's Ki count, not another target's 25 IC50 values
-        found = [(name, actual) for name, actual in candidates.items() if matches(claimed, actual, text, approximate)]
-        if found:
-            name, actual = max(found, key=lambda item: label_overlap(item[0], sentence))
-            shown = f"{actual:.1f}%" if label["percent"] else f"{actual:,g}"
-            return "✓", f"matches {look_id}: {name} = {shown}"
-        for name, actual in candidates.items():
-            if closest is None or abs(actual - claimed) < abs(closest[2] - claimed):
-                closest = (look_id, name, actual)
-    # Not quoted directly: maybe calculated, as a sum or difference of two numbers in one look
-    if not label["percent"]:
-        for look_id in look_ids:
-            numbers = list(ledger[look_id]["numbers"].items())
-            for i, (name_a, a) in enumerate(numbers):
-                for name_b, b in numbers[i + 1:]:
-                    for result, sign in ((a + b, "+"), (abs(a - b), "−")):
-                        if matches(claimed, result, text, approximate):
-                            first, second = (name_a, name_b) if sign == "+" or a >= b else (name_b, name_a)
-                            return "≈", f"calculated from {look_id}: {first} {sign} {second}"
+
+    def shown(actual: float) -> str:
+        return f"{actual:.1f}%" if label["percent"] else f"{actual:,g}"
+
+    cells = [(look_id, name, actual) for look_id in look_ids
+             for name, actual in candidates(ledger[look_id], label["percent"]).items()]
+    found = [cell for cell in cells if matches(claimed, cell[2], text, approximate)]
+    # Several numbers can match: take the one whose label the sentence names ("25 Ki" for that
+    # target's Ki count). If the sentence names none of them, there's no telling which was meant
+    best = max(found, key=lambda cell: label_overlap(cell[1], sentence), default=None)
+    if best and (len(found) == 1 or label_overlap(best[1], sentence)):
+        return "✓", f"matches {best[0]}: {best[1]} = {shown(best[2])}"
+    if not label["percent"] and (sum_or_difference := calculated(claimed, text, approximate, cells)):
+        return "≈", f"calculated from {sum_or_difference}"
+    # The right number from a look cited elsewhere in the text, under the wrong citation
+    elsewhere = [(other, name, actual) for other in dict.fromkeys(section_looks)
+                 if other in ledger and other not in look_ids
+                 for name, actual in candidates(ledger[other], label["percent"]).items()
+                 if matches(claimed, actual, text, approximate) and label_overlap(name, sentence)]
+    if elsewhere:
+        other, name, actual = max(elsewhere, key=lambda cell: label_overlap(cell[1], sentence))
+        return "~", f"matches {other}: {name} = {shown(actual)}, but the sentence cites {', '.join(look_ids)}"
+    if found:
+        return "?", f"{len(found)} numbers in {', '.join(look_ids)} match and the sentence names none of them"
+    # A number that names a category in the look (confidence score "8") isn't a count to check
+    if any(text.replace(",", "") in re.findall(r"[0-9.]+", name) for _, name, _ in cells):
+        return "?", f"names a category in {', '.join(look_ids)}, not a count, so it wasn't checked"
+    closest = min(cells, key=lambda cell: abs(cell[2] - claimed), default=None)
     hint = f"; closest is {closest[0]}: {closest[1]} = {closest[2]:,.4g}" if closest else ""
     return "✗", f"{', '.join(look_ids)} has no such number{hint}"
 
@@ -186,14 +215,15 @@ def audit(sections: dict[str, str], ledger: list[dict], model: str) -> tuple[str
                 return "\n".join(lines), combine(records) if records else None
             records.append(usage)
             for label in parse_labels(answer):
-                result = check(label, block, by_id)
+                result = check(label, block, by_id, LOOK_REF.findall(text))
                 if result:
                     results.append((*result, label["quote"]))
         lines.append(f"{name}: {sum(mark in '✓≈' for mark, _, _ in results)} of "
-                     f"{sum(mark in '✓≈✗!' for mark, _, _ in results)} data claims match their lookups")
+                     f"{sum(mark in '✓≈~✗!' for mark, _, _ in results)} data claims match their lookups")
         lines += [f"  {mark} \"{quote}\": {why}" for mark, why, quote in results]
-    lines.append("Key: ✓ matches · ≈ matches a sum or difference of two numbers in the lookup · "
-                 "✗ doesn't match · ! no lookup cited · ? not checked · · a choice")
+    lines.append("Key: ✓ matches · ≈ matches a sum or difference of two numbers measuring the same thing · "
+                 "~ matches a lookup the sentence doesn't cite · ✗ doesn't match · ! no lookup cited · "
+                 "? not checked · · a choice")
     return "\n".join(lines), combine(records) if records else None
 
 

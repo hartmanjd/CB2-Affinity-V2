@@ -50,6 +50,8 @@ def render(run_id: str, question: str, settings, history: list[dict]) -> str:
             shown = f"> {reply}\n\n*(the lead stopped the run here)*"
         else:
             shown = "> " + (reply or "(blank: revise from the review)").replace("\n", "\n> ")
+        if item.get("auto"):
+            shown += "\n\n*(answered automatically)*"
         lines += ["### Lead", "", shown, ""]
     return "\n".join(lines)
 

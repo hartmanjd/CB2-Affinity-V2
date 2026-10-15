@@ -7,8 +7,10 @@ studies binding affinity at the CB2 receptor. A human approves each step.
 
 You give a research question (or leave it blank for the default one, about CB2). The
 agents are told only that the study uses ChEMBL data; the question decides the topic. The team works
-through stages; each ends with a pause where you type `approve`, write feedback, or press
-Enter to revise from the reviewer's critique.
+through stages; each ends with a pause where you type `approve` (or `ok`, `yes`, `continue`),
+write feedback, or press Enter to revise from the reviewer's critique. The planner is told up
+front what the code fixes (the cutoff, the splits, dropping censored values), so the plan
+doesn't promise what the tools won't do.
 
 1. **Plan:** the planner writes a research plan; the reviewer critiques it.
 2. **Get the data:** the planner searches ChEMBL's targets and counts their activity
@@ -45,8 +47,12 @@ explore → clean → make_dataset → make_split → model → train_and_test �
 opens to show its loop.
 
 The agents decide what matters; the code only answers their questions and checks their
-numbers. Every search, count, look, dry run and try is numbered (L1, L2, ...), as are the split
-and the test scores, so numbers can be traced.
+numbers. Every search, count, look, dry run and try is numbered (L1, L2, ...), as are the split,
+the proposed models' practice scores and the test scores, so numbers can be traced. A number
+matches only if it rounds to the value at the digits written; when several values in a lookup
+match, the sentence must name the one it means. A sum or difference counts only between numbers
+that measure the same thing (compounds before and after a step), and a number cited to the
+wrong lookup is shown where it really is.
 
 Every pause is written to `runs/<run>/log.md`: each round's work, review, audit and costs,
 and what you answered. `runs/<run>/ledger.json` holds every lookup with its full result.
@@ -55,6 +61,11 @@ To try things out without adding to the record, tick `practice` (or pass `--prac
 run behaves exactly the same, including real API costs and downloads, but logs to
 `practice-runs/`, which git ignores. A cheap team (e.g. claude-haiku-5-5 planning,
 gpt-6-luna reviewing, a local auditor) keeps practice to fractions of a cent per round.
+
+To let a run go on its own, tick `auto_approve` (or pass `--auto-approve`): every approval
+pause is answered for you. The plan is revised from the review until it has had
+`auto_plan_rounds` rounds (3 by default), and every other stage is approved after one round.
+Budget pauses still wait for you, and the run log marks each automatic answer.
 
 A run can also start from a clean dataset an earlier run saved: pass
 `--from data/clean/<folder>` (or fill in `start_from` in Studio). Before anything else, code
@@ -84,7 +95,8 @@ pKi ≥ 7) and a **regressor** (the pKi itself). What is chosen and what is fixe
   regressor), the metrics (classifier: ROC AUC, average precision, balanced accuracy, MCC;
   regressor: RMSE, MAE, R², Spearman) and the cutoff.
 - **Baselines:** every model is shown next to "always predict the commonest class / the average"
-  and "copy the most similar training molecule" (nearest neighbour by Tanimoto similarity).
+  and "copy the most similar training molecule" (nearest neighbour by Tanimoto similarity). The
+  copycat's score is graded by how similar that molecule is, so its ROC AUC ranks molecules too.
 - **The test part is locked:** only the final evaluation reads it, and every time it does, a
   line is added to `data/test-use.jsonl`. Test scores come with 95% bootstrap intervals.
 - **Sensitivity:** the classifier is also scored at cutoffs 6 and 8, with the settings chosen
